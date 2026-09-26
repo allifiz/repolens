@@ -1,23 +1,26 @@
 # RepoLens
 
-**Understand any TypeScript/NestJS codebase in seconds.**
+**Understand a TypeScript/NestJS codebase in seconds.**
 
-RepoLens scans a repository locally and turns source code into a browsable graph of files, classes, dependency injection relationships, and NestJS endpoints.
+RepoLens scans a repository locally and turns source code into a browsable graph of endpoints, methods, dependency injection relationships, and database usage.
 
 No code is uploaded anywhere.
 
-## Current MVP
+## Current capabilities
 
 - TypeScript / TSX project scanning
-- NestJS controller detection
-- NestJS service/module/class detection
-- Constructor dependency injection graph
-- Relative import graph
+- NestJS controller, service, module, and class detection
 - HTTP endpoint discovery
+- Endpoint nodes and controller-method nodes
+- Constructor dependency injection graph
+- Controller/service method call tracing
+- Basic Prisma model usage detection
+- Basic raw SQL table detection
+- Relative import graph
 - Standalone local HTML viewer
 - Machine-readable `graph.json`
 
-## Try it
+## Install
 
 ```bash
 git clone https://github.com/allifiz/repolens.git
@@ -26,30 +29,45 @@ npm install
 npm run build
 ```
 
-Scan another project:
+Optional, make the CLI available from any terminal:
 
 ```bash
-node dist/index.js scan /path/to/your/nest-project
+npm link
 ```
 
-Or while developing RepoLens:
+## Scan a service
+
+From the RepoLens folder:
 
 ```bash
-npm run dev -- scan /path/to/your/project
+node dist/index.js scan /home/ganesha/it/repo/db-materi
 ```
 
-RepoLens creates:
+Or after `npm link`:
+
+```bash
+repolens scan /home/ganesha/it/repo/db-materi
+```
+
+Generated output stays inside RepoLens:
 
 ```text
-your-project/
-└── .repolens/
-    ├── graph.json
-    └── index.html
+repolens/
+└── service/
+    └── db-materi/
+        ├── graph.json
+        └── index.html
 ```
 
-Open `.repolens/index.html` in a browser.
+The target repository is not modified.
 
-## Example
+You can still override the destination:
+
+```bash
+repolens scan /path/to/project --output /custom/output
+```
+
+## Endpoint tracing
 
 Given:
 
@@ -59,45 +77,50 @@ export class UserController {
   constructor(private readonly userService: UserService) {}
 
   @Get(':id')
-  findOne() {}
+  findOne() {
+    return this.userService.findOne();
+  }
 }
 ```
 
-RepoLens detects:
+and:
+
+```ts
+@Injectable()
+export class UserService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  findOne() {
+    return this.prisma.user.findUnique(...);
+  }
+}
+```
+
+RepoLens models:
 
 ```text
 GET /users/:id
-
-UserController
-    ↓ injects
-UserService
+    ↓ handled_by
+UserController.findOne()
+    ↓ calls
+UserService.findOne()
+    ↓ queries
+user
 ```
 
-## Vision
+## v0.2 notes
 
-RepoLens should eventually answer questions such as:
+Tracing is static and intentionally conservative.
 
-- What happens when this endpoint is called?
-- Which service touches this database table?
-- Which files matter for this feature?
-- What could break if I change this class?
-- What context should I send to a coding agent?
+Currently it works best for direct calls such as:
 
-The long-term pipeline:
-
-```text
-Codebase
-   ↓
-Static analysis
-   ↓
-Code graph
-   ├── API graph
-   ├── dependency graph
-   ├── database graph
-   └── external-service graph
-          ↓
-      AI context
+```ts
+this.userService.findOne()
+this.prisma.user.findUnique()
+this.prisma.$queryRaw`SELECT ... FROM users`
 ```
+
+Dynamic dispatch, factory-generated services, deeply aliased references, and complex SQL construction may not yet be resolved.
 
 ## Roadmap
 
@@ -110,17 +133,24 @@ Code graph
 - [x] standalone viewer
 
 ### v0.2
-- [ ] trace endpoint → service → repository
-- [ ] detect DTOs and guards
-- [ ] detect Prisma calls
-- [ ] route search and filtering
+- [x] endpoint nodes
+- [x] controller/service method nodes
+- [x] basic endpoint → service tracing
+- [x] basic Prisma usage detection
+- [x] basic raw SQL table detection
+- [x] endpoint-first viewer
+- [x] generated output under `service/<project>`
+- [ ] DTO detection
+- [ ] guards/interceptors detection
+- [ ] tsconfig path alias resolution
 - [ ] richer graph layout
 
 ### v0.3
-- [ ] database/table graph
 - [ ] external HTTP call detection
 - [ ] impact analysis
 - [ ] export endpoint context as Markdown
+- [ ] dedicated `repolens trace` command
+- [ ] dedicated `repolens context` command
 
 ### Later
 - [ ] MCP server
