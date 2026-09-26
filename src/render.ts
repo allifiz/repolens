@@ -38,13 +38,14 @@ export function renderHtml(result: ScanResult): string {
     .endpoint { display:grid; grid-template-columns:62px 1fr; gap:10px; align-items:center; }
     .method { font-weight:800; font-size:11px; color:#b7d1ff; }
     .detail { background:#0e1420; border:1px solid #202a40; border-radius:14px; padding:16px; margin-bottom:16px; }
-    .trace { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .trace-list { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+    .trace-row { display:grid; grid-template-columns:92px minmax(180px,1fr) minmax(180px,1fr); gap:10px; align-items:center; }
+    .trace-kind { color:#7f8ca4; font-size:11px; text-transform:uppercase; letter-spacing:.07em; }
     .trace-step { background:#151d2d; border:1px solid #34415f; border-radius:10px; padding:9px 11px; font-size:12px; }
-    .arrow { color:#60708e; }
-    .db { border-color:#6c5f3f; }
-    .graph { position:relative; min-width:800px; min-height:660px; border:1px solid #20283a; border-radius:14px; background:radial-gradient(circle at center,#111827,#0a0e17 65%); overflow:hidden; }
+    .trace-file { color:#7f8ca4; font-size:11px; overflow-wrap:anywhere; }
+    .graph { position:relative; min-width:920px; min-height:700px; border:1px solid #20283a; border-radius:14px; background:radial-gradient(circle at center,#111827,#0a0e17 65%); overflow:hidden; }
     svg { position:absolute; inset:0; width:100%; height:100%; }
-    .node { position:absolute; width:180px; transform:translate(-50%,-50%); padding:10px; border-radius:10px; background:#151d2d; border:1px solid #34415f; box-shadow:0 12px 35px rgba(0,0,0,.25); cursor:pointer; }
+    .node { position:absolute; width:190px; transform:translate(-50%,-50%); padding:10px; border-radius:10px; background:#151d2d; border:1px solid #34415f; box-shadow:0 12px 35px rgba(0,0,0,.25); cursor:pointer; z-index:2; }
     .node.controller { border-color:#4d70b8; }
     .node.service { border-color:#446e64; }
     .node.module { border-color:#765e9f; }
@@ -53,8 +54,9 @@ export function renderHtml(result: ScanResult): string {
     .node.database { border-color:#8a7040; }
     .node-title { font-size:12px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .node-meta { font-size:10px; color:#7f8ca4; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .edge-label { position:absolute; transform:translate(-50%,-50%); background:#0a0f19; border:1px solid #273149; color:#7f8ca4; padding:3px 6px; border-radius:999px; font-size:9px; z-index:1; pointer-events:none; }
     .empty { padding:30px; text-align:center; color:#6f7b91; }
-    @media (max-width:850px) { main { grid-template-columns:1fr; } aside { position:static; max-height:none; border-right:0; border-bottom:1px solid #20283a; } }
+    @media (max-width:850px) { main { grid-template-columns:1fr; } aside { position:static; max-height:none; border-right:0; border-bottom:1px solid #20283a; } .trace-row { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -82,7 +84,7 @@ export function renderHtml(result: ScanResult): string {
   <section>
     <div id="detail" class="detail">
       <h3>Select an endpoint or symbol</h3>
-      <p class="muted">RepoLens will show its nearby execution graph here.</p>
+      <p class="muted">RepoLens will show its execution path and source locations here.</p>
     </div>
     <div id="graph" class="graph"></div>
   </section>
@@ -114,6 +116,7 @@ function renderSidebar() {
         '<div class="path">' + e.controller + '.' + e.handler + ' · ' + e.file + ':' + e.line + '</div></div>' +
         '</div>';
     }).join('') : '<div class="empty">No endpoints found.</div>';
+
     return;
   }
 
@@ -131,22 +134,22 @@ function renderSidebar() {
 
 function relatedNodes(focusId) {
   if (!focusId) {
-    return DATA.nodes.filter(function (n) { return n.kind === 'endpoint'; }).slice(0, 24);
+    return DATA.nodes.filter(function (n) { return n.kind === 'endpoint'; }).slice(0, 18);
   }
 
   const ids = new Set([focusId]);
   let frontier = [focusId];
 
-  for (let depth = 0; depth < 4; depth++) {
+  for (let depth = 0; depth < 5; depth++) {
     const next = [];
+
     DATA.edges.forEach(function (e) {
       if (frontier.includes(e.source) && !ids.has(e.target)) {
-        ids.add(e.target); next.push(e.target);
-      }
-      if (depth === 0 && frontier.includes(e.target) && !ids.has(e.source)) {
-        ids.add(e.source); next.push(e.source);
+        ids.add(e.target);
+        next.push(e.target);
       }
     });
+
     frontier = next;
     if (!frontier.length) break;
   }
@@ -156,28 +159,76 @@ function relatedNodes(focusId) {
 
 function renderDetail(focusId) {
   const endpoint = endpointByNode(focusId);
+
   if (!endpoint) {
     const node = DATA.nodes.find(function (n) { return n.id === focusId; });
     if (!node) return;
+
     detail.innerHTML = '<div class="tag">' + node.kind + '</div>' +
       '<h3 style="margin-top:6px">' + node.label + '</h3>' +
       '<div class="path">' + node.file + (node.line ? ':' + node.line : '') + '</div>';
+
     return;
   }
 
-  let trace = '<span class="trace-step">' + endpoint.controller + '.' + endpoint.handler + '</span>';
+  let rows = '<div class="trace-row">' +
+    '<div class="trace-kind">controller</div>' +
+    '<div class="trace-step">' + endpoint.controller + '.' + endpoint.handler + '</div>' +
+    '<div class="trace-file">' + endpoint.file + ':' + endpoint.line + '</div>' +
+    '</div>';
+
   endpoint.callChain.forEach(function (step) {
-    trace += '<span class="arrow">→</span><span class="trace-step">' + step.className + '.' + step.method + '</span>';
+    rows += '<div class="trace-row">' +
+      '<div class="trace-kind">call</div>' +
+      '<div class="trace-step">' + step.className + '.' + step.method + '</div>' +
+      '<div class="trace-file">' + step.file + ':' + step.line + '</div>' +
+      '</div>';
   });
+
   endpoint.database.forEach(function (db) {
-    trace += '<span class="arrow">→</span><span class="trace-step db">' + db.kind + ': ' + db.target + '</span>';
+    rows += '<div class="trace-row">' +
+      '<div class="trace-kind">' + db.kind + '</div>' +
+      '<div class="trace-step">' + db.target + '</div>' +
+      '<div class="trace-file">' + db.file + ':' + db.line + '</div>' +
+      '</div>';
   });
 
   detail.innerHTML =
     '<div class="tag">endpoint trace</div>' +
     '<h3 style="margin:6px 0">' + endpoint.method + ' ' + endpoint.path + '</h3>' +
-    '<div class="path" style="margin-bottom:14px">' + endpoint.file + ':' + endpoint.line + '</div>' +
-    '<div class="trace">' + trace + '</div>';
+    '<div class="path">' + endpoint.file + ':' + endpoint.line + '</div>' +
+    '<div class="trace-list">' + rows + '</div>';
+}
+
+function nodeDepths(focusId, nodes) {
+  const ids = new Set(nodes.map(function (n) { return n.id; }));
+  const depths = new Map();
+  depths.set(focusId, 0);
+
+  let frontier = [focusId];
+  let depth = 0;
+
+  while (frontier.length && depth < 8) {
+    const next = [];
+
+    DATA.edges.forEach(function (e) {
+      if (!ids.has(e.source) || !ids.has(e.target)) return;
+      if (!frontier.includes(e.source)) return;
+      if (depths.has(e.target)) return;
+
+      depths.set(e.target, depth + 1);
+      next.push(e.target);
+    });
+
+    frontier = next;
+    depth += 1;
+  }
+
+  nodes.forEach(function (n) {
+    if (!depths.has(n.id)) depths.set(n.id, depth + 1);
+  });
+
+  return depths;
 }
 
 function renderGraph(focusId) {
@@ -190,45 +241,75 @@ function renderGraph(focusId) {
   }
 
   const ids = new Set(nodes.map(function (n) { return n.id; }));
-  const cols = Math.max(2, Math.ceil(Math.sqrt(nodes.length)));
-  const width = Math.max(graph.clientWidth, 800);
-  const height = Math.max(graph.clientHeight, 660);
+  const root = focusId || nodes[0].id;
+  const depths = nodeDepths(root, nodes);
+  const groups = new Map();
+
+  nodes.forEach(function (n) {
+    const d = depths.get(n.id) || 0;
+    const list = groups.get(d) || [];
+    list.push(n);
+    groups.set(d, list);
+  });
+
+  const width = Math.max(graph.clientWidth, 920);
+  const height = Math.max(graph.clientHeight, 700);
+  const maxDepth = Math.max.apply(null, Array.from(groups.keys()));
   const positions = new Map();
 
-  nodes.forEach(function (n, i) {
-    const col = i % cols;
-    const row = Math.floor(i / cols);
-    const rows = Math.ceil(nodes.length / cols);
-    const x = ((col + 1) / (cols + 1)) * width;
-    const y = ((row + 1) / (rows + 1)) * height;
-    positions.set(n.id, {x:x,y:y});
+  Array.from(groups.entries()).sort(function (a,b) { return a[0]-b[0]; }).forEach(function (entry) {
+    const depth = entry[0];
+    const list = entry[1];
+    const x = ((depth + 1) / (maxDepth + 2)) * width;
 
-    const div = document.createElement('div');
-    div.className = 'node ' + n.kind;
-    div.style.left = x + 'px';
-    div.style.top = y + 'px';
-    div.innerHTML = '<div class="tag">' + n.kind + '</div>' +
-      '<div class="node-title">' + n.label + '</div>' +
-      '<div class="node-meta">' + n.file + '</div>';
-    div.onclick = function () { renderDetail(n.id); renderGraph(n.id); };
-    graph.appendChild(div);
+    list.forEach(function (n, index) {
+      const y = ((index + 1) / (list.length + 1)) * height;
+      positions.set(n.id, {x:x,y:y});
+
+      const div = document.createElement('div');
+      div.className = 'node ' + n.kind;
+      div.style.left = x + 'px';
+      div.style.top = y + 'px';
+      div.innerHTML = '<div class="tag">' + n.kind + '</div>' +
+        '<div class="node-title">' + n.label + '</div>' +
+        '<div class="node-meta">' + n.file + (n.line ? ':' + n.line : '') + '</div>';
+
+      div.onclick = function () {
+        renderDetail(n.id);
+        renderGraph(n.id);
+      };
+
+      graph.appendChild(div);
+    });
   });
 
   const svg = document.getElementById('edges');
+
   DATA.edges.filter(function (e) {
     return ids.has(e.source) && ids.has(e.target);
   }).forEach(function (e) {
-    const a = positions.get(e.source), b = positions.get(e.target);
+    const a = positions.get(e.source);
+    const b = positions.get(e.target);
     if (!a || !b || !svg) return;
+
     const line = document.createElementNS('http://www.w3.org/2000/svg','line');
     line.setAttribute('x1', String(a.x));
     line.setAttribute('y1', String(a.y));
     line.setAttribute('x2', String(b.x));
     line.setAttribute('y2', String(b.y));
-    line.setAttribute('stroke', e.type === 'calls' || e.type === 'handled_by' ? '#7184c9' : e.type === 'queries' ? '#8a7040' : '#35415c');
-    line.setAttribute('stroke-width', e.type === 'calls' || e.type === 'handled_by' || e.type === 'queries' ? '2' : '1');
+    line.setAttribute('stroke', e.type === 'queries' ? '#8a7040' : '#7184c9');
+    line.setAttribute('stroke-width', e.type === 'handled_by' || e.type === 'calls' || e.type === 'queries' ? '2' : '1');
     line.setAttribute('opacity','0.8');
     svg.appendChild(line);
+
+    if (e.type === 'handled_by' || e.type === 'calls' || e.type === 'queries') {
+      const label = document.createElement('div');
+      label.className = 'edge-label';
+      label.textContent = e.type;
+      label.style.left = ((a.x + b.x) / 2) + 'px';
+      label.style.top = ((a.y + b.y) / 2) + 'px';
+      graph.appendChild(label);
+    }
   });
 }
 
@@ -242,10 +323,13 @@ document.querySelectorAll('[data-tab]').forEach(function (btn) {
 });
 
 search.addEventListener('input', renderSidebar);
+
 sidebar.addEventListener('click', function (event) {
   const target = event.target;
   if (!(target instanceof Element)) return;
+
   const card = target.closest('[data-node]');
+
   if (card && card instanceof HTMLElement && card.dataset.node) {
     const id = decodeURIComponent(card.dataset.node);
     renderDetail(id);
