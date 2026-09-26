@@ -1,30 +1,37 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { renderHtml } from './render.js';
 import { scanProject } from './scanner.js';
 
 const program = new Command();
+const currentFile = fileURLToPath(import.meta.url);
+const projectRoot = path.resolve(path.dirname(currentFile), '..');
 
 program
   .name('repolens')
   .description('Understand a TypeScript/NestJS codebase in seconds.')
-  .version('0.1.0');
+  .version('0.2.0');
 
 program
   .command('scan')
   .argument('[directory]', 'project directory', '.')
-  .option('-o, --output <directory>', 'output directory', '.repolens')
+  .option('-o, --output <directory>', 'custom output directory')
   .description('scan a codebase and generate a dependency graph + local viewer')
-  .action(async (directory: string, options: { output: string }) => {
+  .action(async (directory: string, options: { output?: string }) => {
     const root = path.resolve(directory);
-    const outputDir = path.resolve(root, options.output);
+    const projectName = path.basename(root);
+    const outputDir = options.output
+      ? path.resolve(options.output)
+      : path.join(projectRoot, 'service', projectName);
 
     console.log(`RepoLens scanning ${root}`);
     const result = await scanProject(root);
 
     await fs.mkdir(outputDir, { recursive: true });
+
     const jsonPath = path.join(outputDir, 'graph.json');
     const htmlPath = path.join(outputDir, 'index.html');
 
