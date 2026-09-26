@@ -7,7 +7,11 @@ export type NodeKind =
   | 'class'
   | 'method'
   | 'endpoint'
-  | 'database';
+  | 'database'
+  | 'dto'
+  | 'guard'
+  | 'interceptor'
+  | 'external';
 
 export interface GraphNode {
   id: string;
@@ -27,7 +31,11 @@ export interface GraphEdge {
     | 'declares'
     | 'handled_by'
     | 'calls'
-    | 'queries';
+    | 'queries'
+    | 'uses_dto'
+    | 'guarded_by'
+    | 'intercepted_by'
+    | 'calls_external';
 }
 
 export interface EndpointTraceStep {
@@ -44,6 +52,20 @@ export interface DatabaseUsage {
   line: number;
 }
 
+export interface RequestBinding {
+  source: 'body' | 'query' | 'param' | 'headers' | 'request' | 'response' | 'unknown';
+  name?: string;
+  type?: string;
+}
+
+export interface ExternalCall {
+  client: string;
+  method: string;
+  target: string;
+  file: string;
+  line: number;
+}
+
 export interface Endpoint {
   id: string;
   nodeId: string;
@@ -53,8 +75,13 @@ export interface Endpoint {
   handler: string;
   file: string;
   line: number;
+  request: RequestBinding[];
+  guards: string[];
+  interceptors: string[];
+  responseType?: string;
   callChain: EndpointTraceStep[];
   database: DatabaseUsage[];
+  externalCalls: ExternalCall[];
 }
 
 export interface ScanResult {
