@@ -83,84 +83,132 @@ let tab = 'symbols';
 
 function renderSidebar() {
   const q = search.value.toLowerCase().trim();
+
   if (tab === 'endpoints') {
-    const items = DATA.endpoints.filter(e => [e.method,e.path,e.controller,e.handler,e.file].join(' ').toLowerCase().includes(q));
-    sidebar.innerHTML = items.length ? items.map(e => `
-      <div class="card endpoint">
-        <span class="method">${e.method}</span>
-        <div><div>${e.path}</div><div class="path">${e.controller}.${e.handler} · ${e.file}:${e.line}</div></div>
-      </div>`).join('') : '<div class="empty">No endpoints found.</div>';
+    const items = DATA.endpoints.filter(function (e) {
+      return [e.method, e.path, e.controller, e.handler, e.file]
+        .join(' ')
+        .toLowerCase()
+        .includes(q);
+    });
+
+    sidebar.innerHTML = items.length
+      ? items.map(function (e) {
+          return '<div class="card endpoint">' +
+            '<span class="method">' + e.method + '</span>' +
+            '<div><div>' + e.path + '</div>' +
+            '<div class="path">' + e.controller + '.' + e.handler +
+            ' · ' + e.file + ':' + e.line + '</div></div></div>';
+        }).join('')
+      : '<div class="empty">No endpoints found.</div>';
+
     return;
   }
 
-  const items = DATA.nodes.filter(n => n.kind !== 'file' && [n.label,n.kind,n.file].join(' ').toLowerCase().includes(q));
-  sidebar.innerHTML = items.length ? items.map(n => `
-    <div class="card" data-node="${encodeURIComponent(n.id)}">
-      <div class="tag">${n.kind}</div>
-      <div>${n.label}</div>
-      <div class="path">${n.file}${n.line ? ':'+n.line : ''}</div>
-    </div>`).join('') : '<div class="empty">No symbols found.</div>';
+  const items = DATA.nodes.filter(function (n) {
+    return n.kind !== 'file' &&
+      [n.label, n.kind, n.file].join(' ').toLowerCase().includes(q);
+  });
+
+  sidebar.innerHTML = items.length
+    ? items.map(function (n) {
+        return '<div class="card" data-node="' + encodeURIComponent(n.id) + '">' +
+          '<div class="tag">' + n.kind + '</div>' +
+          '<div>' + n.label + '</div>' +
+          '<div class="path">' + n.file + (n.line ? ':' + n.line : '') + '</div>' +
+          '</div>';
+      }).join('')
+    : '<div class="empty">No symbols found.</div>';
 }
 
 function renderGraph(focusId) {
   graph.innerHTML = '<svg id="edges"></svg>';
+
   const nodes = focusId
-    ? DATA.nodes.filter(n => n.id === focusId || DATA.edges.some(e => (e.source === focusId && e.target === n.id) || (e.target === focusId && e.source === n.id)))
-    : DATA.nodes.filter(n => n.kind !== 'file').slice(0, 32);
+    ? DATA.nodes.filter(function (n) {
+        return n.id === focusId || DATA.edges.some(function (e) {
+          return (e.source === focusId && e.target === n.id) ||
+            (e.target === focusId && e.source === n.id);
+        });
+      })
+    : DATA.nodes.filter(function (n) { return n.kind !== 'file'; }).slice(0, 32);
 
   if (!nodes.length) {
     graph.innerHTML = '<div class="empty">No graphable symbols found yet.</div>';
     return;
   }
 
-  const ids = new Set(nodes.map(n => n.id));
+  const ids = new Set(nodes.map(function (n) { return n.id; }));
   const cols = Math.max(2, Math.ceil(Math.sqrt(nodes.length)));
   const width = Math.max(graph.clientWidth, 800);
   const height = Math.max(graph.clientHeight, 640);
   const positions = new Map();
 
-  nodes.forEach((n, i) => {
+  nodes.forEach(function (n, i) {
     const col = i % cols;
     const row = Math.floor(i / cols);
     const x = ((col + 1) / (cols + 1)) * width;
     const rows = Math.ceil(nodes.length / cols);
     const y = ((row + 1) / (rows + 1)) * height;
-    positions.set(n.id, {x,y});
+    positions.set(n.id, { x: x, y: y });
 
     const div = document.createElement('div');
     div.className = 'node ' + n.kind;
     div.style.left = x + 'px';
     div.style.top = y + 'px';
-    div.innerHTML = '<div class="tag">'+n.kind+'</div><div class="node-title">'+n.label+'</div><div class="node-meta">'+n.file+'</div>';
-    div.onclick = () => renderGraph(n.id);
+    div.innerHTML =
+      '<div class="tag">' + n.kind + '</div>' +
+      '<div class="node-title">' + n.label + '</div>' +
+      '<div class="node-meta">' + n.file + '</div>';
+    div.onclick = function () { renderGraph(n.id); };
     graph.appendChild(div);
   });
 
   const svg = document.getElementById('edges');
-  DATA.edges.filter(e => ids.has(e.source) && ids.has(e.target)).forEach(e => {
-    const a = positions.get(e.source), b = positions.get(e.target);
-    if (!a || !b) return;
-    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
-    line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
-    line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
-    line.setAttribute('stroke', e.type === 'injects' ? '#6c87c6' : '#35415c');
-    line.setAttribute('stroke-width', e.type === 'injects' ? '2' : '1');
-    line.setAttribute('opacity','0.75');
-    svg.appendChild(line);
-  });
+
+  DATA.edges
+    .filter(function (e) { return ids.has(e.source) && ids.has(e.target); })
+    .forEach(function (e) {
+      const a = positions.get(e.source);
+      const b = positions.get(e.target);
+      if (!a || !b || !svg) return;
+
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('x1', String(a.x));
+      line.setAttribute('y1', String(a.y));
+      line.setAttribute('x2', String(b.x));
+      line.setAttribute('y2', String(b.y));
+      line.setAttribute('stroke', e.type === 'injects' ? '#6c87c6' : '#35415c');
+      line.setAttribute('stroke-width', e.type === 'injects' ? '2' : '1');
+      line.setAttribute('opacity', '0.75');
+      svg.appendChild(line);
+    });
 }
 
-document.querySelectorAll('[data-tab]').forEach(btn => btn.addEventListener('click', () => {
-  document.querySelectorAll('[data-tab]').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  tab = btn.dataset.tab;
-  renderSidebar();
-}));
-search.addEventListener('input', renderSidebar);
-sidebar.addEventListener('click', e => {
-  const card = e.target.closest('[data-node]');
-  if (card) renderGraph(decodeURIComponent(card.dataset.node));
+document.querySelectorAll('[data-tab]').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    document.querySelectorAll('[data-tab]').forEach(function (b) {
+      b.classList.remove('active');
+    });
+
+    btn.classList.add('active');
+    tab = btn.dataset.tab;
+    renderSidebar();
+  });
 });
+
+search.addEventListener('input', renderSidebar);
+
+sidebar.addEventListener('click', function (event) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+
+  const card = target.closest('[data-node]');
+  if (card && card instanceof HTMLElement && card.dataset.node) {
+    renderGraph(decodeURIComponent(card.dataset.node));
+  }
+});
+
 renderSidebar();
 renderGraph();
 </script>
