@@ -14,10 +14,11 @@ No code is uploaded anywhere.
 - Endpoint nodes and controller-method nodes
 - Constructor dependency injection graph
 - Controller/service method call tracing
+- Same-class `this.method()` tracing
 - Basic Prisma model usage detection
-- Basic raw SQL table detection
+- Raw SQL table detection with CTE filtering
 - Relative import graph
-- Standalone local HTML viewer
+- Execution-flow viewer with edge labels
 - Machine-readable `graph.json`
 
 ## Install
@@ -29,21 +30,13 @@ npm install
 npm run build
 ```
 
-Optional, make the CLI available from any terminal:
+Optional:
 
 ```bash
 npm link
 ```
 
 ## Scan a service
-
-From the RepoLens folder:
-
-```bash
-node dist/index.js scan /home/ganesha/it/repo/db-materi
-```
-
-Or after `npm link`:
 
 ```bash
 repolens scan /home/ganesha/it/repo/db-materi
@@ -59,44 +52,11 @@ repolens/
         └── index.html
 ```
 
-The target repository is not modified.
-
-You can still override the destination:
-
-```bash
-repolens scan /path/to/project --output /custom/output
-```
+The scanned repository is not modified.
 
 ## Endpoint tracing
 
-Given:
-
-```ts
-@Controller('users')
-export class UserController {
-  constructor(private readonly userService: UserService) {}
-
-  @Get(':id')
-  findOne() {
-    return this.userService.findOne();
-  }
-}
-```
-
-and:
-
-```ts
-@Injectable()
-export class UserService {
-  constructor(private readonly prisma: PrismaService) {}
-
-  findOne() {
-    return this.prisma.user.findUnique(...);
-  }
-}
-```
-
-RepoLens models:
+RepoLens can now model flows such as:
 
 ```text
 GET /users/:id
@@ -104,23 +64,51 @@ GET /users/:id
 UserController.findOne()
     ↓ calls
 UserService.findOne()
+    ↓ calls
+UserService.loadProfile()
     ↓ queries
 user
 ```
 
-## v0.2 notes
-
-Tracing is static and intentionally conservative.
-
-Currently it works best for direct calls such as:
+It recognizes both injected calls:
 
 ```ts
 this.userService.findOne()
-this.prisma.user.findUnique()
-this.prisma.$queryRaw`SELECT ... FROM users`
 ```
 
-Dynamic dispatch, factory-generated services, deeply aliased references, and complex SQL construction may not yet be resolved.
+and same-class calls:
+
+```ts
+this.loadProfile()
+```
+
+For raw SQL, RepoLens attempts to distinguish CTE names from physical tables.
+
+Example:
+
+```sql
+WITH active_users AS (
+  SELECT * FROM users
+)
+SELECT *
+FROM active_users
+JOIN profiles ON ...
+```
+
+RepoLens keeps:
+
+```text
+users
+profiles
+```
+
+and excludes:
+
+```text
+active_users
+```
+
+from database nodes.
 
 ## Roadmap
 
@@ -135,15 +123,19 @@ Dynamic dispatch, factory-generated services, deeply aliased references, and com
 ### v0.2
 - [x] endpoint nodes
 - [x] controller/service method nodes
-- [x] basic endpoint → service tracing
-- [x] basic Prisma usage detection
-- [x] basic raw SQL table detection
+- [x] endpoint → service tracing
+- [x] same-class method tracing
+- [x] Prisma usage detection
+- [x] raw SQL table detection
+- [x] CTE filtering
 - [x] endpoint-first viewer
+- [x] execution-flow layout
+- [x] edge labels
+- [x] source file + line in trace detail
 - [x] generated output under `service/<project>`
 - [ ] DTO detection
 - [ ] guards/interceptors detection
 - [ ] tsconfig path alias resolution
-- [ ] richer graph layout
 
 ### v0.3
 - [ ] external HTTP call detection
