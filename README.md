@@ -2,7 +2,7 @@
 
 **Understand a TypeScript/NestJS codebase in seconds.**
 
-RepoLens scans a repository locally and turns source code into a browsable graph of endpoints, methods, dependency injection relationships, and database usage.
+RepoLens scans a repository locally and turns source code into a browsable graph of endpoints, methods, request metadata, dependency injection relationships, database usage, and external calls.
 
 No code is uploaded anywhere.
 
@@ -15,12 +15,16 @@ No code is uploaded anywhere.
 - Constructor dependency injection graph
 - Controller/service method call tracing
 - Same-class `this.method()` tracing
+- Request binding detection from `@Body`, `@Query`, `@Param`, `@Headers`, `@Req`, and `@Res`
+- DTO/type detection from controller parameters
+- `@UseGuards` detection at controller and method level
+- `@UseInterceptors` detection at controller and method level
+- Declared response type detection
+- Basic external HTTP call detection for `HttpService` and Axios patterns
 - Basic Prisma model usage detection
-- Raw SQL table detection with stronger PostgreSQL filtering
+- Raw SQL table detection with PostgreSQL filtering
 - CTE filtering, including `WITH RECURSIVE`
-- PostgreSQL table-function filtering such as `jsonb_array_elements(...)`
-- Relative import graph
-- Execution-flow viewer with edge labels
+- Execution-flow viewer with enriched endpoint details
 - Machine-readable `graph.json`
 
 ## Install
@@ -56,72 +60,48 @@ repolens/
 
 The scanned repository is not modified.
 
-## Endpoint tracing
+## Endpoint detail
 
-RepoLens can model flows such as:
+RepoLens can now enrich an endpoint with request, security, execution, database, and external-call metadata.
+
+Example:
 
 ```text
-GET /users/:id
-    ↓ handled_by
-UserController.findOne()
-    ↓ calls
-UserService.findOne()
-    ↓ calls
-UserService.loadProfile()
-    ↓ queries
-user
+GET /api/v1/users/:id
+
+Request
+- param:id → number
+- query → GetUserQueryDto
+
+Guards
+- AuthGuard
+
+Interceptors
+- ResponseInterceptor
+
+Response
+- GetUserResponse
+
+Calls
+- UserController.findOne
+- UserService.findOne
+
+Database
+- user
+
+External
+- GET https://example.internal/api/...
 ```
 
-It recognizes both injected calls:
-
-```ts
-this.userService.findOne()
-```
-
-and same-class calls:
-
-```ts
-this.loadProfile()
-```
+Detection is static and conservative. Dynamic decorators, runtime-generated routes, indirect HTTP clients, and heavily computed URLs may not resolve completely.
 
 ## Raw SQL relation detection
 
 RepoLens attempts to keep actual database relations while ignoring common PostgreSQL constructs that only look table-like to a regex.
 
-For example:
+It supports common CTE patterns, `WITH RECURSIVE`, schema-qualified tables, and filters table functions such as `jsonb_array_elements(...)`.
 
-```sql
-WITH RECURSIVE induk_tree AS (
-  SELECT *
-  FROM t_bab
-),
-filtered AS (
-  SELECT *
-  FROM induk_tree
-)
-SELECT *
-FROM filtered
-JOIN LATERAL jsonb_array_elements(data) x ON true
-JOIN t_soal ts ON true;
-```
-
-RepoLens should keep:
-
-```text
-t_bab
-t_soal
-```
-
-and ignore:
-
-```text
-induk_tree
-filtered
-LATERAL
-jsonb_array_elements
-```
-
-Current SQL analysis remains static and heuristic. It is not a full PostgreSQL parser.
+Current SQL analysis remains heuristic and is not a full PostgreSQL parser.
 
 ## Roadmap
 
@@ -140,19 +120,18 @@ Current SQL analysis remains static and heuristic. It is not a full PostgreSQL p
 - [x] same-class method tracing
 - [x] Prisma usage detection
 - [x] raw SQL table detection
-- [x] CTE filtering
-- [x] PostgreSQL table-function filtering
-- [x] endpoint-first viewer
-- [x] execution-flow layout
-- [x] edge labels
-- [x] source file + line in trace detail
+- [x] CTE / PostgreSQL table-function filtering
+- [x] execution-flow viewer
 - [x] generated output under `service/<project>`
-- [ ] DTO detection
-- [ ] guards/interceptors detection
-- [ ] tsconfig path alias resolution
 
 ### v0.3
-- [ ] external HTTP call detection
+- [x] DTO/request binding detection
+- [x] guard detection
+- [x] interceptor detection
+- [x] response type detection
+- [x] basic external HTTP call detection
+- [x] richer endpoint detail panel
+- [ ] tsconfig path alias resolution
 - [ ] impact analysis
 - [ ] export endpoint context as Markdown
 - [ ] dedicated `repolens trace` command
