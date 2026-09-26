@@ -25,6 +25,9 @@ No code is uploaded anywhere.
 - Swagger response metadata detection from `@ApiResponse`, `@ApiOkResponse`, and related decorators
 - Basic external HTTP call detection for `HttpService` and Axios patterns
 - simple local-variable, string concatenation, and template-literal URL resolution
+- class-property and simple helper-return URL resolution
+- TypeScript import resolution for relative imports, `src/...`, `baseUrl`, and `paths` aliases
+- endpoint tracing from the CLI with `repolens trace`
 - Basic Prisma model usage detection
 - Raw SQL table detection with PostgreSQL filtering
 - CTE filtering, including `WITH RECURSIVE`
@@ -63,6 +66,35 @@ repolens/
 ```
 
 The scanned repository is not modified.
+
+## Trace one endpoint
+
+```bash
+repolens trace "GET /api/v1/bab/all" /home/ganesha/it/repo/db-materi
+```
+
+Example output:
+
+```text
+GET /api/v1/bab/all
+Controller: BabController.getAllBab (src/bab/bab.controller.ts:370)
+
+Request
+  - query -> QueryParamsBab
+
+Calls
+  -> BabService.getBabAll (...)
+  -> ApiService.fetchMapelbyIds (...)
+
+Database
+  -> [raw_sql] t_bab (...)
+  -> [raw_sql] t_mapel_bab (...)
+
+External
+  -> GET process.env.SVC_.../api/v1/...
+```
+
+The command scans the target project and prints the endpoint context directly in the terminal.
 
 ## Endpoint detail
 
@@ -133,16 +165,18 @@ Current SQL analysis remains heuristic and is not a full PostgreSQL parser.
 - [x] global guard/interceptor provider detection
 - [x] Swagger response type detection
 - [x] simple external URL resolution
+- [x] class-property/helper URL resolution
+- [x] endpoint trace CLI
 - [x] DTO/request binding detection
 - [x] guard detection
 - [x] interceptor detection
 - [x] response type detection
 - [x] basic external HTTP call detection
 - [x] richer endpoint detail panel
-- [ ] tsconfig path alias resolution
+- [x] tsconfig path alias resolution
 - [ ] impact analysis
 - [ ] export endpoint context as Markdown
-- [ ] dedicated `repolens trace` command
+- [x] dedicated `repolens trace` command
 - [ ] dedicated `repolens context` command
 
 ### Later
