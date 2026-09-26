@@ -38,8 +38,12 @@ export function renderHtml(result: ScanResult): string {
     .endpoint { display:grid; grid-template-columns:62px 1fr; gap:10px; align-items:center; }
     .method { font-weight:800; font-size:11px; color:#b7d1ff; }
     .detail { background:#0e1420; border:1px solid #202a40; border-radius:14px; padding:16px; margin-bottom:16px; }
+    .summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; margin:14px 0; }
+    .summary-box { background:#111827; border:1px solid #273149; border-radius:10px; padding:11px; }
+    .summary-title { color:#7f8ca4; font-size:10px; text-transform:uppercase; letter-spacing:.08em; margin-bottom:6px; }
+    .summary-value { font-size:12px; overflow-wrap:anywhere; }
     .trace-list { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
-    .trace-row { display:grid; grid-template-columns:92px minmax(180px,1fr) minmax(180px,1fr); gap:10px; align-items:center; }
+    .trace-row { display:grid; grid-template-columns:110px minmax(180px,1fr) minmax(180px,1fr); gap:10px; align-items:center; }
     .trace-kind { color:#7f8ca4; font-size:11px; text-transform:uppercase; letter-spacing:.07em; }
     .trace-step { background:#151d2d; border:1px solid #34415f; border-radius:10px; padding:9px 11px; font-size:12px; }
     .trace-file { color:#7f8ca4; font-size:11px; overflow-wrap:anywhere; }
@@ -52,6 +56,10 @@ export function renderHtml(result: ScanResult): string {
     .node.endpoint { border-color:#6f78d8; }
     .node.method { border-color:#506584; }
     .node.database { border-color:#8a7040; }
+    .node.dto { border-color:#4f7d99; }
+    .node.guard { border-color:#8d5f68; }
+    .node.interceptor { border-color:#7d669b; }
+    .node.external { border-color:#9a6e47; }
     .node-title { font-size:12px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .node-meta { font-size:10px; color:#7f8ca4; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .edge-label { position:absolute; transform:translate(-50%,-50%); background:#0a0f19; border:1px solid #273149; color:#7f8ca4; padding:3px 6px; border-radius:999px; font-size:9px; z-index:1; pointer-events:none; }
@@ -84,7 +92,7 @@ export function renderHtml(result: ScanResult): string {
   <section>
     <div id="detail" class="detail">
       <h3>Select an endpoint or symbol</h3>
-      <p class="muted">RepoLens will show its execution path and source locations here.</p>
+      <p class="muted">RepoLens will show request metadata, execution path, database usage, and external calls here.</p>
     </div>
     <div id="graph" class="graph"></div>
   </section>
@@ -101,22 +109,27 @@ function endpointByNode(id) {
   return DATA.endpoints.find(function (e) { return e.nodeId === id; });
 }
 
+function esc(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 function renderSidebar() {
   const q = search.value.toLowerCase().trim();
 
   if (tab === 'endpoints') {
     const items = DATA.endpoints.filter(function (e) {
-      return [e.method,e.path,e.controller,e.handler,e.file].join(' ').toLowerCase().includes(q);
+      return [e.method,e.path,e.controller,e.handler,e.file,(e.guards||[]).join(' '),(e.request||[]).map(function(r){return r.type||'';}).join(' ')]
+        .join(' ').toLowerCase().includes(q);
     });
 
     sidebar.innerHTML = items.length ? items.map(function (e) {
       return '<div class="card endpoint" data-node="' + encodeURIComponent(e.nodeId) + '">' +
-        '<span class="method">' + e.method + '</span>' +
-        '<div><div>' + e.path + '</div>' +
-        '<div class="path">' + e.controller + '.' + e.handler + ' · ' + e.file + ':' + e.line + '</div></div>' +
+        '<span class="method">' + esc(e.method) + '</span>' +
+        '<div><div>' + esc(e.path) + '</div>' +
+        '<div class="path">' + esc(e.controller + '.' + e.handler + ' · ' + e.file + ':' + e.line) + '</div></div>' +
         '</div>';
     }).join('') : '<div class="empty">No endpoints found.</div>';
-
     return;
   }
 
@@ -127,8 +140,8 @@ function renderSidebar() {
 
   sidebar.innerHTML = items.length ? items.map(function (n) {
     return '<div class="card" data-node="' + encodeURIComponent(n.id) + '">' +
-      '<div class="tag">' + n.kind + '</div><div>' + n.label + '</div>' +
-      '<div class="path">' + n.file + (n.line ? ':' + n.line : '') + '</div></div>';
+      '<div class="tag">' + esc(n.kind) + '</div><div>' + esc(n.label) + '</div>' +
+      '<div class="path">' + esc(n.file + (n.line ? ':' + n.line : '')) + '</div></div>';
   }).join('') : '<div class="empty">No symbols found.</div>';
 }
 
@@ -164,39 +177,77 @@ function renderDetail(focusId) {
     const node = DATA.nodes.find(function (n) { return n.id === focusId; });
     if (!node) return;
 
-    detail.innerHTML = '<div class="tag">' + node.kind + '</div>' +
-      '<h3 style="margin-top:6px">' + node.label + '</h3>' +
-      '<div class="path">' + node.file + (node.line ? ':' + node.line : '') + '</div>';
-
+    detail.innerHTML = '<div class="tag">' + esc(node.kind) + '</div>' +
+      '<h3 style="margin-top:6px">' + esc(node.label) + '</h3>' +
+      '<div class="path">' + esc(node.file + (node.line ? ':' + node.line : '')) + '</div>';
     return;
   }
 
+  const request = endpoint.request || [];
+  const guards = endpoint.guards || [];
+  const interceptors = endpoint.interceptors || [];
+  const externalCalls = endpoint.externalCalls || [];
+
+  const requestText = request.length
+    ? request.map(function (r) {
+        return r.source + (r.name ? ':' + r.name : '') + (r.type ? ' → ' + r.type : '');
+      }).join('<br>')
+    : 'none detected';
+
+  const guardText = guards.length ? guards.join('<br>') : 'none detected';
+  const interceptorText = interceptors.length ? interceptors.join('<br>') : 'none detected';
+  const responseText = endpoint.responseType || 'not declared';
+
   let rows = '<div class="trace-row">' +
     '<div class="trace-kind">controller</div>' +
-    '<div class="trace-step">' + endpoint.controller + '.' + endpoint.handler + '</div>' +
-    '<div class="trace-file">' + endpoint.file + ':' + endpoint.line + '</div>' +
+    '<div class="trace-step">' + esc(endpoint.controller + '.' + endpoint.handler) + '</div>' +
+    '<div class="trace-file">' + esc(endpoint.file + ':' + endpoint.line) + '</div>' +
     '</div>';
+
+  request.forEach(function (binding) {
+    rows += '<div class="trace-row">' +
+      '<div class="trace-kind">' + esc(binding.source) + '</div>' +
+      '<div class="trace-step">' + esc((binding.name ? binding.name + ': ' : '') + (binding.type || 'unknown')) + '</div>' +
+      '<div class="trace-file">request binding</div>' +
+      '</div>';
+  });
 
   endpoint.callChain.forEach(function (step) {
     rows += '<div class="trace-row">' +
       '<div class="trace-kind">call</div>' +
-      '<div class="trace-step">' + step.className + '.' + step.method + '</div>' +
-      '<div class="trace-file">' + step.file + ':' + step.line + '</div>' +
+      '<div class="trace-step">' + esc(step.className + '.' + step.method) + '</div>' +
+      '<div class="trace-file">' + esc(step.file + ':' + step.line) + '</div>' +
       '</div>';
   });
 
   endpoint.database.forEach(function (db) {
     rows += '<div class="trace-row">' +
-      '<div class="trace-kind">' + db.kind + '</div>' +
-      '<div class="trace-step">' + db.target + '</div>' +
-      '<div class="trace-file">' + db.file + ':' + db.line + '</div>' +
+      '<div class="trace-kind">' + esc(db.kind) + '</div>' +
+      '<div class="trace-step">' + esc(db.target) + '</div>' +
+      '<div class="trace-file">' + esc(db.file + ':' + db.line) + '</div>' +
+      '</div>';
+  });
+
+  externalCalls.forEach(function (call) {
+    rows += '<div class="trace-row">' +
+      '<div class="trace-kind">external</div>' +
+      '<div class="trace-step">' + esc(call.method + ' ' + call.target) + '</div>' +
+      '<div class="trace-file">' + esc(call.file + ':' + call.line) + '</div>' +
       '</div>';
   });
 
   detail.innerHTML =
-    '<div class="tag">endpoint trace</div>' +
-    '<h3 style="margin:6px 0">' + endpoint.method + ' ' + endpoint.path + '</h3>' +
-    '<div class="path">' + endpoint.file + ':' + endpoint.line + '</div>' +
+    '<div class="tag">endpoint detail</div>' +
+    '<h3 style="margin:6px 0">' + esc(endpoint.method + ' ' + endpoint.path) + '</h3>' +
+    '<div class="path">' + esc(endpoint.file + ':' + endpoint.line) + '</div>' +
+    '<div class="summary-grid">' +
+      '<div class="summary-box"><div class="summary-title">Request</div><div class="summary-value">' + requestText + '</div></div>' +
+      '<div class="summary-box"><div class="summary-title">Guards</div><div class="summary-value">' + guardText + '</div></div>' +
+      '<div class="summary-box"><div class="summary-title">Interceptors</div><div class="summary-value">' + interceptorText + '</div></div>' +
+      '<div class="summary-box"><div class="summary-title">Response type</div><div class="summary-value">' + esc(responseText) + '</div></div>' +
+      '<div class="summary-box"><div class="summary-title">External calls</div><div class="summary-value">' + externalCalls.length + '</div></div>' +
+      '<div class="summary-box"><div class="summary-title">Database targets</div><div class="summary-value">' + endpoint.database.length + '</div></div>' +
+    '</div>' +
     '<div class="trace-list">' + rows + '</div>';
 }
 
@@ -229,6 +280,15 @@ function nodeDepths(focusId, nodes) {
   });
 
   return depths;
+}
+
+function edgeColor(type) {
+  if (type === 'queries') return '#8a7040';
+  if (type === 'calls_external') return '#9a6e47';
+  if (type === 'guarded_by') return '#8d5f68';
+  if (type === 'intercepted_by') return '#7d669b';
+  if (type === 'uses_dto') return '#4f7d99';
+  return '#7184c9';
 }
 
 function renderGraph(focusId) {
@@ -270,9 +330,9 @@ function renderGraph(focusId) {
       div.className = 'node ' + n.kind;
       div.style.left = x + 'px';
       div.style.top = y + 'px';
-      div.innerHTML = '<div class="tag">' + n.kind + '</div>' +
-        '<div class="node-title">' + n.label + '</div>' +
-        '<div class="node-meta">' + n.file + (n.line ? ':' + n.line : '') + '</div>';
+      div.innerHTML = '<div class="tag">' + esc(n.kind) + '</div>' +
+        '<div class="node-title">' + esc(n.label) + '</div>' +
+        '<div class="node-meta">' + esc(n.file + (n.line ? ':' + n.line : '')) + '</div>';
 
       div.onclick = function () {
         renderDetail(n.id);
@@ -297,19 +357,17 @@ function renderGraph(focusId) {
     line.setAttribute('y1', String(a.y));
     line.setAttribute('x2', String(b.x));
     line.setAttribute('y2', String(b.y));
-    line.setAttribute('stroke', e.type === 'queries' ? '#8a7040' : '#7184c9');
-    line.setAttribute('stroke-width', e.type === 'handled_by' || e.type === 'calls' || e.type === 'queries' ? '2' : '1');
+    line.setAttribute('stroke', edgeColor(e.type));
+    line.setAttribute('stroke-width', '2');
     line.setAttribute('opacity','0.8');
     svg.appendChild(line);
 
-    if (e.type === 'handled_by' || e.type === 'calls' || e.type === 'queries') {
-      const label = document.createElement('div');
-      label.className = 'edge-label';
-      label.textContent = e.type;
-      label.style.left = ((a.x + b.x) / 2) + 'px';
-      label.style.top = ((a.y + b.y) / 2) + 'px';
-      graph.appendChild(label);
-    }
+    const label = document.createElement('div');
+    label.className = 'edge-label';
+    label.textContent = e.type;
+    label.style.left = ((a.x + b.x) / 2) + 'px';
+    label.style.top = ((a.y + b.y) / 2) + 'px';
+    graph.appendChild(label);
   });
 }
 
