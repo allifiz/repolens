@@ -16,7 +16,9 @@ No code is uploaded anywhere.
 - Controller/service method call tracing
 - Same-class `this.method()` tracing
 - Basic Prisma model usage detection
-- Raw SQL table detection with CTE filtering
+- Raw SQL table detection with stronger PostgreSQL filtering
+- CTE filtering, including `WITH RECURSIVE`
+- PostgreSQL table-function filtering such as `jsonb_array_elements(...)`
 - Relative import graph
 - Execution-flow viewer with edge labels
 - Machine-readable `graph.json`
@@ -56,7 +58,7 @@ The scanned repository is not modified.
 
 ## Endpoint tracing
 
-RepoLens can now model flows such as:
+RepoLens can model flows such as:
 
 ```text
 GET /users/:id
@@ -82,33 +84,44 @@ and same-class calls:
 this.loadProfile()
 ```
 
-For raw SQL, RepoLens attempts to distinguish CTE names from physical tables.
+## Raw SQL relation detection
 
-Example:
+RepoLens attempts to keep actual database relations while ignoring common PostgreSQL constructs that only look table-like to a regex.
+
+For example:
 
 ```sql
-WITH active_users AS (
-  SELECT * FROM users
+WITH RECURSIVE induk_tree AS (
+  SELECT *
+  FROM t_bab
+),
+filtered AS (
+  SELECT *
+  FROM induk_tree
 )
 SELECT *
-FROM active_users
-JOIN profiles ON ...
+FROM filtered
+JOIN LATERAL jsonb_array_elements(data) x ON true
+JOIN t_soal ts ON true;
 ```
 
-RepoLens keeps:
+RepoLens should keep:
 
 ```text
-users
-profiles
+t_bab
+t_soal
 ```
 
-and excludes:
+and ignore:
 
 ```text
-active_users
+induk_tree
+filtered
+LATERAL
+jsonb_array_elements
 ```
 
-from database nodes.
+Current SQL analysis remains static and heuristic. It is not a full PostgreSQL parser.
 
 ## Roadmap
 
@@ -128,6 +141,7 @@ from database nodes.
 - [x] Prisma usage detection
 - [x] raw SQL table detection
 - [x] CTE filtering
+- [x] PostgreSQL table-function filtering
 - [x] endpoint-first viewer
 - [x] execution-flow layout
 - [x] edge labels
