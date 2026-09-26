@@ -49,11 +49,17 @@ interface ParsedMethod {
   body?: ts.Block;
   source: ts.SourceFile;
   injections: Map<string, string>;
+  classProperties: Map<string, ts.Expression>;
 }
 
 interface EndpointSeed {
   endpoint: Endpoint;
   methodNodeId: string;
+}
+
+interface ImportConfig {
+  baseUrl: string;
+  paths: Record<string, string[]>;
 }
 
 function normalizePath(value: string): string {
@@ -101,26 +107,84 @@ function joinRoute(base: string, child: string): string {
   return '/' + parts.join('/');
 }
 
+function fileCandidates(base: string): string[] {
+  const normalized = normalizePath(base);
+  return [
+    normalized,
+    `${normalized}.ts`,
+    `${normalized}.tsx`,
+    `${normalized}/index.ts`,
+    `${normalized}/index.tsx`,
+  ];
+}
+
 function resolveImport(
   fromFile: string,
   specifier: string,
   knownFiles: Set<string>,
+  importConfig: ImportConfig,
 ): string | undefined {
-  if (!specifier.startsWith('.')) return undefined;
+  if (specifier.startsWith('.')) {
+    const base = normalizePath(
+      path.posix.normalize(path.posix.join(path.posix.dirname(fromFile), specifier)),
+    );
 
-  const base = normalizePath(
-    path.posix.normalize(path.posix.join(path.posix.dirname(fromFile), specifier)),
-  );
+    return fileCandidates(base).find((candidate) => knownFiles.has(candidate));
+  }
 
-  const candidates = [
-    base,
-    `${base}.ts`,
-    `${base}.tsx`,
-    `${base}/index.ts`,
-    `${base}/index.tsx`,
-  ];
+  if (specifier.startsWith('src/')) {
+    return fileCandidates(specifier).find((candidate) => knownFiles.has(candidate));
+  }
 
-  return candidates.find((candidate) => knownFiles.has(candidate));
+  for (const [pattern, targets] of Object.entries(importConfig.paths)) {
+    const starIndex = pattern.indexOf('*');
+    const prefix = starIndex >= 0 ? pattern.slice(0, starIndex) : pattern;
+    const suffix = starIndex >= 0 ? pattern.slice(starIndex + 1) : '';
+
+    if (!specifier.startsWith(prefix) || !specifier.endsWith(suffix)) continue;
+
+    const wildcard = starIndex >= 0
+      ? specifier.slice(prefix.length, specifier.length - suffix.length)
+      : '';
+
+    for (const target of targets) {
+      const mapped = target.includes('*')
+        ? target.replace('*', wildcard)
+        : target;
+      const base = normalizePath(
+        path.posix.join(importConfig.baseUrl, mapped),
+      );
+      const match = fileCandidates(base).find((candidate) => knownFiles.has(candidate));
+      if (match) return match;
+    }
+  }
+
+  if (importConfig.baseUrl && importConfig.baseUrl !== '.') {
+    const base = normalizePath(path.posix.join(importConfig.baseUrl, specifier));
+    return fileCandidates(base).find((candidate) => knownFiles.has(candidate));
+  }
+
+  return undefined;
+}
+
+async function loadImportConfig(rootDir: string): Promise<ImportConfig> {
+  try {
+    const raw = JSON.parse(
+      await fs.readFile(path.join(rootDir, 'tsconfig.json'), 'utf8'),
+    ) as {
+      compilerOptions?: {
+        baseUrl?: string;
+        paths?: Record<string, string[]>;
+      };
+    };
+
+    return {
+      baseUrl: normalizePath(raw.compilerOptions?.baseUrl ?? '.'),
+      paths: raw.compilerOptions?.paths ?? {},
+    };
+  } catch {
+    return { baseUrl: '.', paths: {} };
+  }
 }
 
 function methodNameOf(member: ts.MethodDeclaration, source: ts.SourceFile): string {
@@ -128,6 +192,18 @@ function methodNameOf(member: ts.MethodDeclaration, source: ts.SourceFile): stri
     return member.name.text;
   }
   return member.name.getText(source);
+}
+
+function classPropertyInitializers(statement: ts.ClassDeclaration): Map<string, ts.Expression> {
+  const result = new Map<string, ts.Expression>();
+
+  for (const member of statement.members) {
+    if (!ts.isPropertyDeclaration(member) || !member.initializer) continue;
+    if (!ts.isIdentifier(member.name)) continue;
+    result.set(member.name.text, member.initializer);
+  }
+
+  return result;
 }
 
 function constructorInjections(statement: ts.ClassDeclaration): Map<string, string> {
@@ -410,6 +486,8 @@ function resolveSimpleExpression(
   expression: ts.Expression | undefined,
   source: ts.SourceFile,
   variables: Map<string, ts.Expression>,
+  classProperties: Map<string, ts.Expression>,
+  helperResolver?: (methodName: string) => string | undefined,
   depth = 0,
 ): string | undefined {
   if (!expression || depth > 6) return undefined;
@@ -419,7 +497,7 @@ function resolveSimpleExpression(
   if (ts.isIdentifier(expression)) {
     const next = variables.get(expression.text);
     return next
-      ? resolveSimpleExpression(next, source, variables, depth + 1)
+      ? resolveSimpleExpression(next, source, variables, classProperties, helperResolver, depth + 1)
       : expression.text;
   }
 
@@ -433,6 +511,8 @@ function resolveSimpleExpression(
         span.expression,
         source,
         variables,
+        classProperties,
+        helperResolver,
         depth + 1,
       );
       value += resolved ? `${resolved}` : `\${${span.expression.getText(source)}}`;
@@ -443,14 +523,59 @@ function resolveSimpleExpression(
   }
 
   if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-    const left = resolveSimpleExpression(expression.left, source, variables, depth + 1);
-    const right = resolveSimpleExpression(expression.right, source, variables, depth + 1);
+    const left = resolveSimpleExpression(expression.left, source, variables, classProperties, helperResolver, depth + 1);
+    const right = resolveSimpleExpression(expression.right, source, variables, classProperties, helperResolver, depth + 1);
 
     if (left !== undefined && right !== undefined) return left + right;
   }
 
   if (ts.isPropertyAccessExpression(expression)) {
+    if (
+      expression.expression.kind === ts.SyntaxKind.ThisKeyword &&
+      classProperties.has(expression.name.text)
+    ) {
+      return resolveSimpleExpression(
+        classProperties.get(expression.name.text),
+        source,
+        variables,
+        classProperties,
+        helperResolver,
+        depth + 1,
+      );
+    }
+
     return expression.getText(source);
+  }
+
+  if (
+    ts.isCallExpression(expression) &&
+    ts.isPropertyAccessExpression(expression.expression) &&
+    expression.expression.expression.kind === ts.SyntaxKind.ThisKeyword &&
+    helperResolver
+  ) {
+    return helperResolver(expression.expression.name.text) ?? expression.getText(source);
+  }
+
+  if (ts.isParenthesizedExpression(expression)) {
+    return resolveSimpleExpression(
+      expression.expression,
+      source,
+      variables,
+      classProperties,
+      helperResolver,
+      depth + 1,
+    );
+  }
+
+  if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) {
+    return resolveSimpleExpression(
+      expression.left,
+      source,
+      variables,
+      classProperties,
+      helperResolver,
+      depth + 1,
+    );
   }
 
   return expression.getText(source);
@@ -459,11 +584,18 @@ function resolveSimpleExpression(
 function externalTargetFromArgs(
   call: ts.CallExpression,
   method: ParsedMethod,
+  helperResolver?: (methodName: string) => string | undefined,
 ): string {
   const variables = collectSimpleVariables(method);
 
   for (const arg of call.arguments) {
-    const resolved = resolveSimpleExpression(arg, method.source, variables);
+    const resolved = resolveSimpleExpression(
+      arg,
+      method.source,
+      variables,
+      method.classProperties,
+      helperResolver,
+    );
     if (resolved && resolved !== arg.getText(method.source)) return resolved;
     if (ts.isStringLiteralLike(arg) || ts.isTemplateExpression(arg)) {
       return resolved ?? arg.getText(method.source);
@@ -471,12 +603,19 @@ function externalTargetFromArgs(
   }
 
   const first = call.arguments[0];
-  return resolveSimpleExpression(first, method.source, variables) ?? 'dynamic';
+  return resolveSimpleExpression(
+    first,
+    method.source,
+    variables,
+    method.classProperties,
+    helperResolver,
+  ) ?? 'dynamic';
 }
 
 function extractExternalCall(
   call: ts.CallExpression,
   method: ParsedMethod,
+  helperResolver?: (methodName: string) => string | undefined,
 ): ExternalCall | undefined {
   if (!ts.isPropertyAccessExpression(call.expression)) return undefined;
 
@@ -506,7 +645,7 @@ function extractExternalCall(
 
   if (!client) return undefined;
 
-  const target = externalTargetFromArgs(call, method);
+  const target = externalTargetFromArgs(call, method, helperResolver);
 
   return {
     client,
@@ -574,6 +713,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
 
   const normalizedFiles = files.map(normalizePath);
   const knownFiles = new Set(normalizedFiles);
+  const importConfig = await loadImportConfig(absoluteRoot);
   const globalGuards = new Set<string>();
   const globalInterceptors = new Set<string>();
   const nodes: GraphNode[] = [];
@@ -621,7 +761,12 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
 
     for (const statement of source.statements) {
       if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
-        const targetFile = resolveImport(file, statement.moduleSpecifier.text, knownFiles);
+        const targetFile = resolveImport(
+          file,
+          statement.moduleSpecifier.text,
+          knownFiles,
+          importConfig,
+        );
 
         if (targetFile) {
           edges.push({ source: fileNodeId, target: `file:${targetFile}`, type: 'imports' });
@@ -636,6 +781,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
       const line = source.getLineAndCharacterOfPosition(statement.getStart()).line + 1;
       const classNodeId = `symbol:${file}:${className}`;
       const injections = constructorInjections(statement);
+      const classProperties = classPropertyInitializers(statement);
       const classGuards = extractNamedDecoratorValues(decorators, 'UseGuards', source);
       const classInterceptors = extractNamedDecoratorValues(decorators, 'UseInterceptors', source);
 
@@ -676,6 +822,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           body: member.body,
           source,
           injections,
+          classProperties,
         });
 
         if (!controllerDecorator) continue;
@@ -851,7 +998,28 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
         const prisma = extractPrismaUsage(call, method);
         if (prisma) database.push(prisma);
 
-        const externalCall = extractExternalCall(call, method);
+        const helperResolver = (helperName: string): string | undefined => {
+          const helper = methodByClassAndName.get(`${method.className}.${helperName}`);
+          if (!helper?.body) return undefined;
+
+          const returnStatement = helper.body.statements.find(
+            (statement): statement is ts.ReturnStatement =>
+              ts.isReturnStatement(statement) && !!statement.expression,
+          );
+
+          if (!returnStatement?.expression) return undefined;
+
+          const helperVariables = collectSimpleVariables(helper);
+          return resolveSimpleExpression(
+            returnStatement.expression,
+            helper.source,
+            helperVariables,
+            helper.classProperties,
+            undefined,
+          );
+        };
+
+        const externalCall = extractExternalCall(call, method, helperResolver);
         if (externalCall) external.push(externalCall);
       });
     }
