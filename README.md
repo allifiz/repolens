@@ -16,11 +16,15 @@ No code is uploaded anywhere.
 - Controller/service method call tracing
 - Same-class `this.method()` tracing
 - Request binding detection from `@Body`, `@Query`, `@Param`, `@Headers`, `@Req`, and `@Res`
-- DTO/type detection from controller parameters
+- DTO/type detection from controller parameters without primitive-type nodes
 - `@UseGuards` detection at controller and method level
+- global `APP_GUARD` provider detection
 - `@UseInterceptors` detection at controller and method level
+- global `APP_INTERCEPTOR` provider detection
 - Declared response type detection
+- Swagger response metadata detection from `@ApiResponse`, `@ApiOkResponse`, and related decorators
 - Basic external HTTP call detection for `HttpService` and Axios patterns
+- simple local-variable, string concatenation, and template-literal URL resolution
 - Basic Prisma model usage detection
 - Raw SQL table detection with PostgreSQL filtering
 - CTE filtering, including `WITH RECURSIVE`
@@ -125,6 +129,10 @@ Current SQL analysis remains heuristic and is not a full PostgreSQL parser.
 - [x] generated output under `service/<project>`
 
 ### v0.3
+- [x] primitive request types kept out of DTO graph
+- [x] global guard/interceptor provider detection
+- [x] Swagger response type detection
+- [x] simple external URL resolution
 - [x] DTO/request binding detection
 - [x] guard detection
 - [x] interceptor detection
