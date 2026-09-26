@@ -14,6 +14,28 @@ import type {
 
 const HTTP_DECORATORS = new Set(['Get', 'Post', 'Put', 'Patch', 'Delete', 'Options', 'Head', 'All']);
 
+const NON_TABLE_RELATIONS = new Set([
+  'lateral',
+  'filter',
+  'values',
+  'unnest',
+  'generate_series',
+  'json_array_elements',
+  'json_array_elements_text',
+  'json_each',
+  'json_each_text',
+  'json_object_keys',
+  'jsonb_array_elements',
+  'jsonb_array_elements_text',
+  'jsonb_each',
+  'jsonb_each_text',
+  'jsonb_object_keys',
+  'json_to_record',
+  'json_to_recordset',
+  'jsonb_to_record',
+  'jsonb_to_recordset',
+]);
+
 interface ParsedMethod {
   className: string;
   classKind: NodeKind;
@@ -181,37 +203,71 @@ function extractPrismaUsage(
 
 function extractCteNames(sql: string): Set<string> {
   const names = new Set<string>();
-  const withIndex = sql.search(/\bWITH\b/i);
-  if (withIndex < 0) return names;
 
-  const head = sql.slice(withIndex);
-  const regex = /(?:\bWITH\b|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(/gi;
+  const regex =
+    /(?:\bWITH\b(?:\s+RECURSIVE)?|,)\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*(?:\([^)]*\)\s*)?AS\s*(?:NOT\s+MATERIALIZED\s+|MATERIALIZED\s+)?\(/gi;
+
   let match: RegExpExecArray | null;
 
-  while ((match = regex.exec(head))) {
-    names.add(match[1].toLowerCase());
+  while ((match = regex.exec(sql))) {
+    const name = (match[1] ?? match[2])?.toLowerCase();
+    if (name) names.add(name);
   }
 
   return names;
+}
+
+function normalizeRelationName(raw: string): string {
+  return raw.replace(/["'`]/g, '');
+}
+
+function isProbablyTableReference(
+  sql: string,
+  relationStart: number,
+  rawTarget: string,
+  cteNames: Set<string>,
+): boolean {
+  const target = normalizeRelationName(rawTarget);
+  const simpleName = target.split('.').pop()?.toLowerCase() ?? target.toLowerCase();
+
+  if (!simpleName) return false;
+  if (cteNames.has(simpleName)) return false;
+  if (NON_TABLE_RELATIONS.has(simpleName)) return false;
+
+  const after = sql.slice(relationStart + rawTarget.length).trimStart();
+
+  // FROM some_function(...) / JOIN some_function(...) is a table function, not a table.
+  if (after.startsWith('(')) return false;
+
+  return true;
 }
 
 function extractRawSqlTables(method: ParsedMethod): DatabaseUsage[] {
   if (!method.body) return [];
 
   const text = method.body.getText(method.source);
-  if (!/\$(?:queryRaw|executeRaw|queryRawUnsafe|executeRawUnsafe)/.test(text)) return [];
+
+  if (!/\$(?:queryRaw|executeRaw|queryRawUnsafe|executeRawUnsafe)/.test(text)) {
+    return [];
+  }
 
   const cteNames = extractCteNames(text);
   const tables = new Set<string>();
+
   const regex =
-    /\b(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM)\s+["'`]?([A-Za-z_][A-Za-z0-9_.]*)/gi;
+    /\b(?:FROM|JOIN|UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+(?:ONLY\s+)?((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))?)/gi;
+
   let match: RegExpExecArray | null;
 
   while ((match = regex.exec(text))) {
-    const target = match[1].replace(/["'`]/g, '');
-    const simpleName = target.split('.').pop()?.toLowerCase() ?? target.toLowerCase();
+    const rawTarget = match[1];
+    const rawOffset = match.index + match[0].lastIndexOf(rawTarget);
 
-    if (cteNames.has(simpleName)) continue;
+    if (!isProbablyTableReference(text, rawOffset, rawTarget, cteNames)) {
+      continue;
+    }
+
+    const target = normalizeRelationName(rawTarget).replace(/\s+/g, '');
     tables.add(target);
   }
 
@@ -284,6 +340,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
     );
 
     const fileNodeId = `file:${file}`;
+
     nodes.push({
       id: fileNodeId,
       label: path.posix.basename(file),
@@ -293,7 +350,11 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
 
     for (const statement of source.statements) {
       if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
-        const targetFile = resolveImport(file, statement.moduleSpecifier.text, knownFiles);
+        const targetFile = resolveImport(
+          file,
+          statement.moduleSpecifier.text,
+          knownFiles,
+        );
 
         if (targetFile) {
           edges.push({
@@ -503,10 +564,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
     }
 
     const rawSqlTables = extractRawSqlTables(method);
-
-    if (rawSqlTables.length > 0) {
-      database.push(...rawSqlTables);
-    }
+    if (rawSqlTables.length > 0) database.push(...rawSqlTables);
 
     const deduped = uniqueDatabase(database);
     databaseByMethod.set(method.nodeId, deduped);
