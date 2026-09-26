@@ -1,6 +1,6 @@
 {
   "name": "repolens",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Understand a TypeScript/NestJS codebase in seconds with endpoint-aware local code graphs.",
   "type": "module",
   "bin": {
