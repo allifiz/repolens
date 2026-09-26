@@ -6,9 +6,11 @@ import type {
   DatabaseUsage,
   Endpoint,
   EndpointTraceStep,
+  ExternalCall,
   GraphEdge,
   GraphNode,
   NodeKind,
+  RequestBinding,
   ScanResult,
 } from './types.js';
 
@@ -74,6 +76,12 @@ function decoratorStringArg(decorator: ts.Decorator): string {
   if (!ts.isCallExpression(expr) || expr.arguments.length === 0) return '';
   const arg = expr.arguments[0];
   return ts.isStringLiteralLike(arg) ? arg.text : '';
+}
+
+function decoratorArgs(decorator: ts.Decorator, source: ts.SourceFile): string[] {
+  const expr = decorator.expression;
+  if (!ts.isCallExpression(expr)) return [];
+  return expr.arguments.map((arg) => arg.getText(source));
 }
 
 function getDecorators(node: ts.Node): readonly ts.Decorator[] {
@@ -189,21 +197,18 @@ function extractPrismaUsage(
     /^this\.(?:prisma|prismaService)\.([A-Za-z0-9_]+)\.(findMany|findUnique|findFirst|create|createMany|update|updateMany|delete|deleteMany|upsert|count|aggregate|groupBy)$/,
   );
 
-  if (modelMatch) {
-    return {
-      kind: 'prisma',
-      target: modelMatch[1],
-      file: method.file,
-      line,
-    };
-  }
+  if (!modelMatch) return undefined;
 
-  return undefined;
+  return {
+    kind: 'prisma',
+    target: modelMatch[1],
+    file: method.file,
+    line,
+  };
 }
 
 function extractCteNames(sql: string): Set<string> {
   const names = new Set<string>();
-
   const regex =
     /(?:\bWITH\b(?:\s+RECURSIVE)?|,)\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*(?:\([^)]*\)\s*)?AS\s*(?:NOT\s+MATERIALIZED\s+|MATERIALIZED\s+)?\(/gi;
 
@@ -235,11 +240,7 @@ function isProbablyTableReference(
   if (NON_TABLE_RELATIONS.has(simpleName)) return false;
 
   const after = sql.slice(relationStart + rawTarget.length).trimStart();
-
-  // FROM some_function(...) / JOIN some_function(...) is a table function, not a table.
-  if (after.startsWith('(')) return false;
-
-  return true;
+  return !after.startsWith('(');
 }
 
 function extractRawSqlTables(method: ParsedMethod): DatabaseUsage[] {
@@ -253,7 +254,6 @@ function extractRawSqlTables(method: ParsedMethod): DatabaseUsage[] {
 
   const cteNames = extractCteNames(text);
   const tables = new Set<string>();
-
   const regex =
     /\b(?:FROM|JOIN|UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+(?:ONLY\s+)?((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))?)/gi;
 
@@ -263,12 +263,9 @@ function extractRawSqlTables(method: ParsedMethod): DatabaseUsage[] {
     const rawTarget = match[1];
     const rawOffset = match.index + match[0].lastIndexOf(rawTarget);
 
-    if (!isProbablyTableReference(text, rawOffset, rawTarget, cteNames)) {
-      continue;
-    }
+    if (!isProbablyTableReference(text, rawOffset, rawTarget, cteNames)) continue;
 
-    const target = normalizeRelationName(rawTarget).replace(/\s+/g, '');
-    tables.add(target);
+    tables.add(normalizeRelationName(rawTarget).replace(/\s+/g, ''));
   }
 
   return [...tables].map((target) => ({
@@ -277,6 +274,122 @@ function extractRawSqlTables(method: ParsedMethod): DatabaseUsage[] {
     file: method.file,
     line: method.line,
   }));
+}
+
+function requestSource(name: string | undefined): RequestBinding['source'] {
+  switch (name) {
+    case 'Body': return 'body';
+    case 'Query': return 'query';
+    case 'Param': return 'param';
+    case 'Headers':
+    case 'Header': return 'headers';
+    case 'Req':
+    case 'Request': return 'request';
+    case 'Res':
+    case 'Response': return 'response';
+    default: return 'unknown';
+  }
+}
+
+function extractRequestBindings(
+  member: ts.MethodDeclaration,
+  source: ts.SourceFile,
+): RequestBinding[] {
+  return member.parameters.flatMap((parameter) => {
+    const decorators = getDecorators(parameter);
+
+    return decorators.map((decorator) => {
+      const name = decoratorName(decorator);
+      const args = decoratorArgs(decorator, source);
+      const type = parameter.type?.getText(source);
+
+      return {
+        source: requestSource(name),
+        name: args[0]?.replace(/^['"]|['"]$/g, ''),
+        type,
+      };
+    }).filter((binding) => binding.source !== 'unknown');
+  });
+}
+
+function extractNamedDecoratorValues(
+  decorators: readonly ts.Decorator[],
+  wanted: string,
+  source: ts.SourceFile,
+): string[] {
+  const values: string[] = [];
+
+  for (const decorator of decorators) {
+    if (decoratorName(decorator) !== wanted) continue;
+
+    for (const arg of decoratorArgs(decorator, source)) {
+      values.push(arg);
+    }
+  }
+
+  return values;
+}
+
+function unwrapResponseType(typeText: string | undefined): string | undefined {
+  if (!typeText) return undefined;
+
+  const promise = typeText.match(/^Promise\s*<(.+)>$/s);
+  return (promise?.[1] ?? typeText).trim();
+}
+
+function externalTargetFromArgs(call: ts.CallExpression, source: ts.SourceFile): string {
+  const args = call.arguments.map((arg) => arg.getText(source));
+
+  for (const arg of args) {
+    if (ts.isStringLiteralLike(call.arguments[args.indexOf(arg)])) {
+      return arg.replace(/^['"]|['"]$/g, '');
+    }
+  }
+
+  return args.slice(0, 3).join(' ');
+}
+
+function extractExternalCall(
+  call: ts.CallExpression,
+  method: ParsedMethod,
+): ExternalCall | undefined {
+  if (!ts.isPropertyAccessExpression(call.expression)) return undefined;
+
+  const expressionText = call.expression.getText(method.source);
+  const line = method.source.getLineAndCharacterOfPosition(call.getStart()).line + 1;
+
+  let client = '';
+  let httpMethod = '';
+
+  const thisClient = expressionText.match(
+    /^this\.(httpService|axios|axiosService)\.(get|post|put|patch|delete|head|request|fetch)$/i,
+  );
+
+  if (thisClient) {
+    client = thisClient[1];
+    httpMethod = thisClient[2].toUpperCase();
+  }
+
+  const axiosCall = expressionText.match(
+    /^axios\.(get|post|put|patch|delete|head|request)$/i,
+  );
+
+  if (!client && axiosCall) {
+    client = 'axios';
+    httpMethod = axiosCall[1].toUpperCase();
+  }
+
+  if (!client) return undefined;
+
+  const target = externalTargetFromArgs(call, method.source);
+
+  return {
+    client,
+    method: httpMethod,
+    target: target || 'dynamic',
+    file: method.file,
+    line,
+  };
 }
 
 function uniqueDatabase(items: DatabaseUsage[]): DatabaseUsage[] {
@@ -288,6 +401,21 @@ function uniqueDatabase(items: DatabaseUsage[]): DatabaseUsage[] {
     seen.add(key);
     return true;
   });
+}
+
+function uniqueExternal(items: ExternalCall[]): ExternalCall[] {
+  const seen = new Set<string>();
+
+  return items.filter((item) => {
+    const key = `${item.client}:${item.method}:${item.target}:${item.file}:${item.line}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function uniqueStrings(items: string[]): string[] {
+  return [...new Set(items)];
 }
 
 function uniqueEdges(edges: GraphEdge[]): GraphEdge[] {
@@ -328,9 +456,23 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
   const parsedMethods: ParsedMethod[] = [];
   const symbolToNode = new Map<string, string>();
 
+  function ensureMetadataNode(
+    kind: 'dto' | 'guard' | 'interceptor' | 'external',
+    label: string,
+    file: string,
+    line: number,
+  ): string {
+    const id = `${kind}:${label}`;
+
+    if (!nodes.some((node) => node.id === id)) {
+      nodes.push({ id, label, kind, file, line });
+    }
+
+    return id;
+  }
+
   for (const file of normalizedFiles) {
     const sourceText = await fs.readFile(path.join(absoluteRoot, file), 'utf8');
-
     const source = ts.createSourceFile(
       file,
       sourceText,
@@ -340,28 +482,14 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
     );
 
     const fileNodeId = `file:${file}`;
-
-    nodes.push({
-      id: fileNodeId,
-      label: path.posix.basename(file),
-      kind: 'file',
-      file,
-    });
+    nodes.push({ id: fileNodeId, label: path.posix.basename(file), kind: 'file', file });
 
     for (const statement of source.statements) {
       if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
-        const targetFile = resolveImport(
-          file,
-          statement.moduleSpecifier.text,
-          knownFiles,
-        );
+        const targetFile = resolveImport(file, statement.moduleSpecifier.text, knownFiles);
 
         if (targetFile) {
-          edges.push({
-            source: fileNodeId,
-            target: `file:${targetFile}`,
-            type: 'imports',
-          });
+          edges.push({ source: fileNodeId, target: `file:${targetFile}`, type: 'imports' });
         }
       }
 
@@ -373,37 +501,23 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
       const line = source.getLineAndCharacterOfPosition(statement.getStart()).line + 1;
       const classNodeId = `symbol:${file}:${className}`;
       const injections = constructorInjections(statement);
+      const classGuards = extractNamedDecoratorValues(decorators, 'UseGuards', source);
+      const classInterceptors = extractNamedDecoratorValues(decorators, 'UseInterceptors', source);
 
-      nodes.push({
-        id: classNodeId,
-        label: className,
-        kind,
-        file,
-        line,
-      });
-
+      nodes.push({ id: classNodeId, label: className, kind, file, line });
       symbolToNode.set(className, classNodeId);
-
-      edges.push({
-        source: fileNodeId,
-        target: classNodeId,
-        type: 'declares',
-      });
+      edges.push({ source: fileNodeId, target: classNodeId, type: 'declares' });
 
       const controllerDecorator = decorators.find(
         (decorator) => decoratorName(decorator) === 'Controller',
       );
-
-      const controllerPath = controllerDecorator
-        ? decoratorStringArg(controllerDecorator)
-        : '';
+      const controllerPath = controllerDecorator ? decoratorStringArg(controllerDecorator) : '';
 
       for (const member of statement.members) {
         if (!ts.isMethodDeclaration(member) || !member.name) continue;
 
         const methodName = methodNameOf(member, source);
-        const methodLine =
-          source.getLineAndCharacterOfPosition(member.getStart()).line + 1;
+        const methodLine = source.getLineAndCharacterOfPosition(member.getStart()).line + 1;
         const methodNodeId = `method:${file}:${className}.${methodName}`;
 
         nodes.push({
@@ -414,11 +528,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           line: methodLine,
         });
 
-        edges.push({
-          source: classNodeId,
-          target: methodNodeId,
-          type: 'declares',
-        });
+        edges.push({ source: classNodeId, target: methodNodeId, type: 'declares' });
 
         parsedMethods.push({
           className,
@@ -448,6 +558,16 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
         const fullPath = joinRoute(controllerPath, routePath);
         const endpointNodeId =
           `endpoint:${httpMethod.toUpperCase()}:${fullPath}:${className}.${methodName}`;
+        const request = extractRequestBindings(member, source);
+        const guards = uniqueStrings([
+          ...classGuards,
+          ...extractNamedDecoratorValues(methodDecorators, 'UseGuards', source),
+        ]);
+        const interceptors = uniqueStrings([
+          ...classInterceptors,
+          ...extractNamedDecoratorValues(methodDecorators, 'UseInterceptors', source),
+        ]);
+        const responseType = unwrapResponseType(member.type?.getText(source));
 
         nodes.push({
           id: endpointNodeId,
@@ -461,11 +581,23 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           },
         });
 
-        edges.push({
-          source: endpointNodeId,
-          target: methodNodeId,
-          type: 'handled_by',
-        });
+        edges.push({ source: endpointNodeId, target: methodNodeId, type: 'handled_by' });
+
+        for (const binding of request) {
+          if (!binding.type) continue;
+          const dtoId = ensureMetadataNode('dto', binding.type, file, methodLine);
+          edges.push({ source: endpointNodeId, target: dtoId, type: 'uses_dto' });
+        }
+
+        for (const guard of guards) {
+          const guardId = ensureMetadataNode('guard', guard, file, methodLine);
+          edges.push({ source: endpointNodeId, target: guardId, type: 'guarded_by' });
+        }
+
+        for (const interceptor of interceptors) {
+          const interceptorId = ensureMetadataNode('interceptor', interceptor, file, methodLine);
+          edges.push({ source: endpointNodeId, target: interceptorId, type: 'intercepted_by' });
+        }
 
         endpointSeeds.push({
           methodNodeId,
@@ -478,8 +610,13 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
             handler: methodName,
             file,
             line: methodLine,
+            request,
+            guards,
+            interceptors,
+            responseType,
             callChain: [],
             database: [],
+            externalCalls: [],
           },
         });
       }
@@ -496,12 +633,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
       const key = `${method.classNodeId}->${target}`;
       if (existingInjectEdges.has(key)) continue;
 
-      edges.push({
-        source: method.classNodeId,
-        target,
-        type: 'injects',
-      });
-
+      edges.push({ source: method.classNodeId, target, type: 'injects' });
       existingInjectEdges.add(key);
     }
   }
@@ -509,16 +641,15 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
   const methodByClassAndName = new Map<string, ParsedMethod>();
 
   for (const method of parsedMethods) {
-    methodByClassAndName.set(
-      `${method.className}.${method.methodName}`,
-      method,
-    );
+    methodByClassAndName.set(`${method.className}.${method.methodName}`, method);
   }
 
   const databaseByMethod = new Map<string, DatabaseUsage[]>();
+  const externalByMethod = new Map<string, ExternalCall[]>();
 
   for (const method of parsedMethods) {
     const database: DatabaseUsage[] = [];
+    const external: ExternalCall[] = [];
 
     if (method.body) {
       visitCalls(method.body, (call) => {
@@ -533,11 +664,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
             );
 
             if (targetMethod) {
-              edges.push({
-                source: method.nodeId,
-                target: targetMethod.nodeId,
-                type: 'calls',
-              });
+              edges.push({ source: method.nodeId, target: targetMethod.nodeId, type: 'calls' });
             }
           }
         }
@@ -550,26 +677,28 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           );
 
           if (targetMethod && targetMethod.nodeId !== method.nodeId) {
-            edges.push({
-              source: method.nodeId,
-              target: targetMethod.nodeId,
-              type: 'calls',
-            });
+            edges.push({ source: method.nodeId, target: targetMethod.nodeId, type: 'calls' });
           }
         }
 
         const prisma = extractPrismaUsage(call, method);
         if (prisma) database.push(prisma);
+
+        const externalCall = extractExternalCall(call, method);
+        if (externalCall) external.push(externalCall);
       });
     }
 
     const rawSqlTables = extractRawSqlTables(method);
     if (rawSqlTables.length > 0) database.push(...rawSqlTables);
 
-    const deduped = uniqueDatabase(database);
-    databaseByMethod.set(method.nodeId, deduped);
+    const dedupedDatabase = uniqueDatabase(database);
+    const dedupedExternal = uniqueExternal(external);
 
-    for (const usage of deduped) {
+    databaseByMethod.set(method.nodeId, dedupedDatabase);
+    externalByMethod.set(method.nodeId, dedupedExternal);
+
+    for (const usage of dedupedDatabase) {
       const databaseNodeId = `database:${usage.kind}:${usage.target}`;
 
       if (!nodes.some((node) => node.id === databaseNodeId)) {
@@ -579,16 +708,25 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           kind: 'database',
           file: usage.file,
           line: usage.line,
-          metadata: {
-            databaseKind: usage.kind,
-          },
+          metadata: { databaseKind: usage.kind },
         });
       }
 
+      edges.push({ source: method.nodeId, target: databaseNodeId, type: 'queries' });
+    }
+
+    for (const usage of dedupedExternal) {
+      const externalNodeId = ensureMetadataNode(
+        'external',
+        `${usage.method} ${usage.target}`,
+        usage.file,
+        usage.line,
+      );
+
       edges.push({
         source: method.nodeId,
-        target: databaseNodeId,
-        type: 'queries',
+        target: externalNodeId,
+        type: 'calls_external',
       });
     }
   }
@@ -599,28 +737,25 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
 
   for (const edge of edges) {
     if (edge.type !== 'calls') continue;
-
     const list = outgoingCalls.get(edge.source) ?? [];
     list.push(edge.target);
     outgoingCalls.set(edge.source, list);
   }
 
-  const methodById = new Map(
-    parsedMethods.map((method) => [method.nodeId, method]),
-  );
+  const methodById = new Map(parsedMethods.map((method) => [method.nodeId, method]));
 
   for (const seed of endpointSeeds) {
     const visited = new Set<string>();
     const queue = [seed.methodNodeId];
     const callChain: EndpointTraceStep[] = [];
     const database: DatabaseUsage[] = [];
+    const externalCalls: ExternalCall[] = [];
 
     while (queue.length > 0) {
       const methodId = queue.shift()!;
       if (visited.has(methodId)) continue;
 
       visited.add(methodId);
-
       const method = methodById.get(methodId);
 
       if (method && methodId !== seed.methodNodeId) {
@@ -633,6 +768,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
       }
 
       database.push(...(databaseByMethod.get(methodId) ?? []));
+      externalCalls.push(...(externalByMethod.get(methodId) ?? []));
 
       for (const target of outgoingCalls.get(methodId) ?? []) {
         if (!visited.has(target)) queue.push(target);
@@ -641,6 +777,7 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
 
     seed.endpoint.callChain = callChain;
     seed.endpoint.database = uniqueDatabase(database);
+    seed.endpoint.externalCalls = uniqueExternal(externalCalls);
     endpoints.push(seed.endpoint);
   }
 
