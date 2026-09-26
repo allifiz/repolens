@@ -337,16 +337,141 @@ function unwrapResponseType(typeText: string | undefined): string | undefined {
   return (promise?.[1] ?? typeText).trim();
 }
 
-function externalTargetFromArgs(call: ts.CallExpression, source: ts.SourceFile): string {
-  const args = call.arguments.map((arg) => arg.getText(source));
+function isDtoLikeType(typeText: string | undefined): boolean {
+  if (!typeText) return false;
 
-  for (const arg of args) {
-    if (ts.isStringLiteralLike(call.arguments[args.indexOf(arg)])) {
-      return arg.replace(/^['"]|['"]$/g, '');
+  const normalized = typeText.replace(/\s+/g, '');
+  const primitive = /^(?:string|number|boolean|bigint|symbol|any|unknown|object|void|never|null|undefined)(?:\[\])?$/;
+
+  if (primitive.test(normalized)) return false;
+  if (/^(?:Array|ReadonlyArray)<(?:string|number|boolean|any|unknown)>$/.test(normalized)) return false;
+  if (/^(?:Request|Response|IncomingMessage|ServerResponse)$/.test(normalized)) return false;
+
+  return /^[A-Za-z_$][A-Za-z0-9_$]*(?:<.*>)?(?:\[\])?$/.test(normalized);
+}
+
+function extractSwaggerResponseType(
+  decorators: readonly ts.Decorator[],
+  source: ts.SourceFile,
+): string | undefined {
+  const supported = new Set([
+    'ApiResponse',
+    'ApiOkResponse',
+    'ApiCreatedResponse',
+    'ApiAcceptedResponse',
+    'ApiNoContentResponse',
+  ]);
+
+  for (const decorator of decorators) {
+    const name = decoratorName(decorator);
+    if (!name || !supported.has(name)) continue;
+
+    const expr = decorator.expression;
+    if (!ts.isCallExpression(expr)) continue;
+
+    for (const arg of expr.arguments) {
+      if (!ts.isObjectLiteralExpression(arg)) continue;
+
+      for (const property of arg.properties) {
+        if (!ts.isPropertyAssignment(property)) continue;
+
+        const propertyName = property.name.getText(source).replace(/['"]/g, '');
+        if (propertyName !== 'type') continue;
+
+        if (ts.isArrayLiteralExpression(property.initializer)) {
+          const first = property.initializer.elements[0];
+          return first ? `${first.getText(source)}[]` : undefined;
+        }
+
+        return property.initializer.getText(source);
+      }
     }
   }
 
-  return args.slice(0, 3).join(' ');
+  return undefined;
+}
+
+function collectSimpleVariables(method: ParsedMethod): Map<string, ts.Expression> {
+  const result = new Map<string, ts.Expression>();
+  if (!method.body) return result;
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      result.set(node.name.text, node.initializer);
+    }
+    node.forEachChild(visit);
+  };
+
+  visit(method.body);
+  return result;
+}
+
+function resolveSimpleExpression(
+  expression: ts.Expression | undefined,
+  source: ts.SourceFile,
+  variables: Map<string, ts.Expression>,
+  depth = 0,
+): string | undefined {
+  if (!expression || depth > 6) return undefined;
+
+  if (ts.isStringLiteralLike(expression)) return expression.text;
+
+  if (ts.isIdentifier(expression)) {
+    const next = variables.get(expression.text);
+    return next
+      ? resolveSimpleExpression(next, source, variables, depth + 1)
+      : expression.text;
+  }
+
+  if (ts.isNoSubstitutionTemplateLiteral(expression)) return expression.text;
+
+  if (ts.isTemplateExpression(expression)) {
+    let value = expression.head.text;
+
+    for (const span of expression.templateSpans) {
+      const resolved = resolveSimpleExpression(
+        span.expression,
+        source,
+        variables,
+        depth + 1,
+      );
+      value += resolved ? `${resolved}` : `\${${span.expression.getText(source)}}`;
+      value += span.literal.text;
+    }
+
+    return value;
+  }
+
+  if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = resolveSimpleExpression(expression.left, source, variables, depth + 1);
+    const right = resolveSimpleExpression(expression.right, source, variables, depth + 1);
+
+    if (left !== undefined && right !== undefined) return left + right;
+  }
+
+  if (ts.isPropertyAccessExpression(expression)) {
+    return expression.getText(source);
+  }
+
+  return expression.getText(source);
+}
+
+function externalTargetFromArgs(
+  call: ts.CallExpression,
+  method: ParsedMethod,
+): string {
+  const variables = collectSimpleVariables(method);
+
+  for (const arg of call.arguments) {
+    const resolved = resolveSimpleExpression(arg, method.source, variables);
+    if (resolved && resolved !== arg.getText(method.source)) return resolved;
+    if (ts.isStringLiteralLike(arg) || ts.isTemplateExpression(arg)) {
+      return resolved ?? arg.getText(method.source);
+    }
+  }
+
+  const first = call.arguments[0];
+  return resolveSimpleExpression(first, method.source, variables) ?? 'dynamic';
 }
 
 function extractExternalCall(
@@ -381,7 +506,7 @@ function extractExternalCall(
 
   if (!client) return undefined;
 
-  const target = externalTargetFromArgs(call, method.source);
+  const target = externalTargetFromArgs(call, method);
 
   return {
     client,
@@ -449,6 +574,8 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
 
   const normalizedFiles = files.map(normalizePath);
   const knownFiles = new Set(normalizedFiles);
+  const globalGuards = new Set<string>();
+  const globalInterceptors = new Set<string>();
   const nodes: GraphNode[] = [];
   let edges: GraphEdge[] = [];
   const endpoints: Endpoint[] = [];
@@ -480,6 +607,14 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
       true,
       file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
     );
+
+    const providerRegex = /provide\s*:\s*(APP_GUARD|APP_INTERCEPTOR)[\s\S]{0,220}?(?:useClass|useExisting)\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)/g;
+    let providerMatch: RegExpExecArray | null;
+
+    while ((providerMatch = providerRegex.exec(sourceText))) {
+      if (providerMatch[1] === 'APP_GUARD') globalGuards.add(providerMatch[2]);
+      if (providerMatch[1] === 'APP_INTERCEPTOR') globalInterceptors.add(providerMatch[2]);
+    }
 
     const fileNodeId = `file:${file}`;
     nodes.push({ id: fileNodeId, label: path.posix.basename(file), kind: 'file', file });
@@ -567,7 +702,9 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           ...classInterceptors,
           ...extractNamedDecoratorValues(methodDecorators, 'UseInterceptors', source),
         ]);
-        const responseType = unwrapResponseType(member.type?.getText(source));
+        const responseType =
+          extractSwaggerResponseType(methodDecorators, source) ??
+          unwrapResponseType(member.type?.getText(source));
 
         nodes.push({
           id: endpointNodeId,
@@ -584,8 +721,8 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
         edges.push({ source: endpointNodeId, target: methodNodeId, type: 'handled_by' });
 
         for (const binding of request) {
-          if (!binding.type) continue;
-          const dtoId = ensureMetadataNode('dto', binding.type, file, methodLine);
+          if (!isDtoLikeType(binding.type)) continue;
+          const dtoId = ensureMetadataNode('dto', binding.type!, file, methodLine);
           edges.push({ source: endpointNodeId, target: dtoId, type: 'uses_dto' });
         }
 
@@ -620,6 +757,36 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           },
         });
       }
+    }
+  }
+
+  for (const seed of endpointSeeds) {
+    seed.endpoint.guards = uniqueStrings([
+      ...seed.endpoint.guards,
+      ...globalGuards,
+    ]);
+    seed.endpoint.interceptors = uniqueStrings([
+      ...seed.endpoint.interceptors,
+      ...globalInterceptors,
+    ]);
+
+    for (const guard of globalGuards) {
+      const guardId = ensureMetadataNode('guard', guard, seed.endpoint.file, seed.endpoint.line);
+      edges.push({ source: seed.endpoint.nodeId, target: guardId, type: 'guarded_by' });
+    }
+
+    for (const interceptor of globalInterceptors) {
+      const interceptorId = ensureMetadataNode(
+        'interceptor',
+        interceptor,
+        seed.endpoint.file,
+        seed.endpoint.line,
+      );
+      edges.push({
+        source: seed.endpoint.nodeId,
+        target: interceptorId,
+        type: 'intercepted_by',
+      });
     }
   }
 
