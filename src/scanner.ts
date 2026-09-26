@@ -77,9 +77,11 @@ function resolveImport(
   knownFiles: Set<string>,
 ): string | undefined {
   if (!specifier.startsWith('.')) return undefined;
+
   const base = normalizePath(
     path.posix.normalize(path.posix.join(path.posix.dirname(fromFile), specifier)),
   );
+
   const candidates = [
     base,
     `${base}.ts`,
@@ -87,6 +89,7 @@ function resolveImport(
     `${base}/index.ts`,
     `${base}/index.tsx`,
   ];
+
   return candidates.find((candidate) => knownFiles.has(candidate));
 }
 
@@ -125,19 +128,30 @@ function visitCalls(node: ts.Node, visitor: (call: ts.CallExpression) => void): 
   node.forEachChild((child) => visitCalls(child, visitor));
 }
 
-function extractThisCall(call: ts.CallExpression): { property: string; method: string } | undefined {
+function extractInjectedThisCall(
+  call: ts.CallExpression,
+): { property: string; method: string } | undefined {
   if (!ts.isPropertyAccessExpression(call.expression)) return undefined;
+
   const outer = call.expression;
-
   if (!ts.isPropertyAccessExpression(outer.expression)) return undefined;
-  const owner = outer.expression;
 
+  const owner = outer.expression;
   if (owner.expression.kind !== ts.SyntaxKind.ThisKeyword) return undefined;
 
   return {
     property: owner.name.text,
     method: outer.name.text,
   };
+}
+
+function extractLocalThisCall(call: ts.CallExpression): string | undefined {
+  if (!ts.isPropertyAccessExpression(call.expression)) return undefined;
+
+  const expression = call.expression;
+  if (expression.expression.kind !== ts.SyntaxKind.ThisKeyword) return undefined;
+
+  return expression.name.text;
 }
 
 function extractPrismaUsage(
@@ -162,16 +176,23 @@ function extractPrismaUsage(
     };
   }
 
-  if (/^this\.(?:prisma|prismaService)\.\$(?:queryRaw|executeRaw|queryRawUnsafe|executeRawUnsafe)$/.test(expressionText)) {
-    return {
-      kind: 'raw_sql',
-      target: 'raw_sql',
-      file: method.file,
-      line,
-    };
+  return undefined;
+}
+
+function extractCteNames(sql: string): Set<string> {
+  const names = new Set<string>();
+  const withIndex = sql.search(/\bWITH\b/i);
+  if (withIndex < 0) return names;
+
+  const head = sql.slice(withIndex);
+  const regex = /(?:\bWITH\b|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(head))) {
+    names.add(match[1].toLowerCase());
   }
 
-  return undefined;
+  return names;
 }
 
 function extractRawSqlTables(method: ParsedMethod): DatabaseUsage[] {
@@ -180,12 +201,18 @@ function extractRawSqlTables(method: ParsedMethod): DatabaseUsage[] {
   const text = method.body.getText(method.source);
   if (!/\$(?:queryRaw|executeRaw|queryRawUnsafe|executeRawUnsafe)/.test(text)) return [];
 
+  const cteNames = extractCteNames(text);
   const tables = new Set<string>();
-  const regex = /\b(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM)\s+["'`]?([A-Za-z_][A-Za-z0-9_.]*)/gi;
+  const regex =
+    /\b(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM)\s+["'`]?([A-Za-z_][A-Za-z0-9_.]*)/gi;
   let match: RegExpExecArray | null;
 
   while ((match = regex.exec(text))) {
-    tables.add(match[1].replace(/["'`]/g, ''));
+    const target = match[1].replace(/["'`]/g, '');
+    const simpleName = target.split('.').pop()?.toLowerCase() ?? target.toLowerCase();
+
+    if (cteNames.has(simpleName)) continue;
+    tables.add(target);
   }
 
   return [...tables].map((target) => ({
@@ -198,6 +225,7 @@ function extractRawSqlTables(method: ParsedMethod): DatabaseUsage[] {
 
 function uniqueDatabase(items: DatabaseUsage[]): DatabaseUsage[] {
   const seen = new Set<string>();
+
   return items.filter((item) => {
     const key = `${item.kind}:${item.target}:${item.file}:${item.line}`;
     if (seen.has(key)) return false;
@@ -206,8 +234,20 @@ function uniqueDatabase(items: DatabaseUsage[]): DatabaseUsage[] {
   });
 }
 
+function uniqueEdges(edges: GraphEdge[]): GraphEdge[] {
+  const seen = new Set<string>();
+
+  return edges.filter((edge) => {
+    const key = `${edge.type}:${edge.source}->${edge.target}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export async function scanProject(rootDir: string): Promise<ScanResult> {
   const absoluteRoot = path.resolve(rootDir);
+
   const files = await fg(['**/*.ts', '**/*.tsx'], {
     cwd: absoluteRoot,
     ignore: [
@@ -226,15 +266,15 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
   const normalizedFiles = files.map(normalizePath);
   const knownFiles = new Set(normalizedFiles);
   const nodes: GraphNode[] = [];
-  const edges: GraphEdge[] = [];
+  let edges: GraphEdge[] = [];
   const endpoints: Endpoint[] = [];
   const endpointSeeds: EndpointSeed[] = [];
   const parsedMethods: ParsedMethod[] = [];
   const symbolToNode = new Map<string, string>();
-  const classFile = new Map<string, string>();
 
   for (const file of normalizedFiles) {
     const sourceText = await fs.readFile(path.join(absoluteRoot, file), 'utf8');
+
     const source = ts.createSourceFile(
       file,
       sourceText,
@@ -244,13 +284,23 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
     );
 
     const fileNodeId = `file:${file}`;
-    nodes.push({ id: fileNodeId, label: path.posix.basename(file), kind: 'file', file });
+    nodes.push({
+      id: fileNodeId,
+      label: path.posix.basename(file),
+      kind: 'file',
+      file,
+    });
 
     for (const statement of source.statements) {
       if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
         const targetFile = resolveImport(file, statement.moduleSpecifier.text, knownFiles);
+
         if (targetFile) {
-          edges.push({ source: fileNodeId, target: `file:${targetFile}`, type: 'imports' });
+          edges.push({
+            source: fileNodeId,
+            target: `file:${targetFile}`,
+            type: 'imports',
+          });
         }
       }
 
@@ -263,14 +313,26 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
       const classNodeId = `symbol:${file}:${className}`;
       const injections = constructorInjections(statement);
 
-      nodes.push({ id: classNodeId, label: className, kind, file, line });
+      nodes.push({
+        id: classNodeId,
+        label: className,
+        kind,
+        file,
+        line,
+      });
+
       symbolToNode.set(className, classNodeId);
-      classFile.set(className, file);
-      edges.push({ source: fileNodeId, target: classNodeId, type: 'declares' });
+
+      edges.push({
+        source: fileNodeId,
+        target: classNodeId,
+        type: 'declares',
+      });
 
       const controllerDecorator = decorators.find(
         (decorator) => decoratorName(decorator) === 'Controller',
       );
+
       const controllerPath = controllerDecorator
         ? decoratorStringArg(controllerDecorator)
         : '';
@@ -290,7 +352,12 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           file,
           line: methodLine,
         });
-        edges.push({ source: classNodeId, target: methodNodeId, type: 'declares' });
+
+        edges.push({
+          source: classNodeId,
+          target: methodNodeId,
+          type: 'declares',
+        });
 
         parsedMethods.push({
           className,
@@ -312,12 +379,14 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           const name = decoratorName(decorator);
           return name ? HTTP_DECORATORS.has(name) : false;
         });
+
         if (!httpDecorator) continue;
 
         const httpMethod = decoratorName(httpDecorator) ?? 'GET';
         const routePath = decoratorStringArg(httpDecorator);
         const fullPath = joinRoute(controllerPath, routePath);
-        const endpointNodeId = `endpoint:${httpMethod.toUpperCase()}:${fullPath}:${className}.${methodName}`;
+        const endpointNodeId =
+          `endpoint:${httpMethod.toUpperCase()}:${fullPath}:${className}.${methodName}`;
 
         nodes.push({
           id: endpointNodeId,
@@ -357,20 +426,32 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
   }
 
   const existingInjectEdges = new Set<string>();
+
   for (const method of parsedMethods) {
     for (const [, typeName] of method.injections) {
       const target = symbolToNode.get(typeName);
       if (!target) continue;
+
       const key = `${method.classNodeId}->${target}`;
       if (existingInjectEdges.has(key)) continue;
-      edges.push({ source: method.classNodeId, target, type: 'injects' });
+
+      edges.push({
+        source: method.classNodeId,
+        target,
+        type: 'injects',
+      });
+
       existingInjectEdges.add(key);
     }
   }
 
   const methodByClassAndName = new Map<string, ParsedMethod>();
+
   for (const method of parsedMethods) {
-    methodByClassAndName.set(`${method.className}.${method.methodName}`, method);
+    methodByClassAndName.set(
+      `${method.className}.${method.methodName}`,
+      method,
+    );
   }
 
   const databaseByMethod = new Map<string, DatabaseUsage[]>();
@@ -380,13 +461,16 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
 
     if (method.body) {
       visitCalls(method.body, (call) => {
-        const thisCall = extractThisCall(call);
-        if (thisCall) {
-          const injectedType = method.injections.get(thisCall.property);
+        const injectedCall = extractInjectedThisCall(call);
+
+        if (injectedCall) {
+          const injectedType = method.injections.get(injectedCall.property);
+
           if (injectedType) {
             const targetMethod = methodByClassAndName.get(
-              `${injectedType}.${thisCall.method}`,
+              `${injectedType}.${injectedCall.method}`,
             );
+
             if (targetMethod) {
               edges.push({
                 source: method.nodeId,
@@ -397,17 +481,39 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           }
         }
 
+        const localMethodName = extractLocalThisCall(call);
+
+        if (localMethodName) {
+          const targetMethod = methodByClassAndName.get(
+            `${method.className}.${localMethodName}`,
+          );
+
+          if (targetMethod && targetMethod.nodeId !== method.nodeId) {
+            edges.push({
+              source: method.nodeId,
+              target: targetMethod.nodeId,
+              type: 'calls',
+            });
+          }
+        }
+
         const prisma = extractPrismaUsage(call, method);
         if (prisma) database.push(prisma);
       });
     }
 
-    database.push(...extractRawSqlTables(method));
+    const rawSqlTables = extractRawSqlTables(method);
+
+    if (rawSqlTables.length > 0) {
+      database.push(...rawSqlTables);
+    }
+
     const deduped = uniqueDatabase(database);
     databaseByMethod.set(method.nodeId, deduped);
 
     for (const usage of deduped) {
       const databaseNodeId = `database:${usage.kind}:${usage.target}`;
+
       if (!nodes.some((node) => node.id === databaseNodeId)) {
         nodes.push({
           id: databaseNodeId,
@@ -415,9 +521,12 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
           kind: 'database',
           file: usage.file,
           line: usage.line,
-          metadata: { databaseKind: usage.kind },
+          metadata: {
+            databaseKind: usage.kind,
+          },
         });
       }
+
       edges.push({
         source: method.nodeId,
         target: databaseNodeId,
@@ -426,15 +535,21 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
     }
   }
 
+  edges = uniqueEdges(edges);
+
   const outgoingCalls = new Map<string, string[]>();
+
   for (const edge of edges) {
     if (edge.type !== 'calls') continue;
+
     const list = outgoingCalls.get(edge.source) ?? [];
     list.push(edge.target);
     outgoingCalls.set(edge.source, list);
   }
 
-  const methodById = new Map(parsedMethods.map((method) => [method.nodeId, method]));
+  const methodById = new Map(
+    parsedMethods.map((method) => [method.nodeId, method]),
+  );
 
   for (const seed of endpointSeeds) {
     const visited = new Set<string>();
@@ -445,9 +560,11 @@ export async function scanProject(rootDir: string): Promise<ScanResult> {
     while (queue.length > 0) {
       const methodId = queue.shift()!;
       if (visited.has(methodId)) continue;
+
       visited.add(methodId);
 
       const method = methodById.get(methodId);
+
       if (method && methodId !== seed.methodNodeId) {
         callChain.push({
           className: method.className,
